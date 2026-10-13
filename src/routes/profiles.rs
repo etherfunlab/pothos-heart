@@ -23,7 +23,9 @@ fn default_true() -> bool {
 /// orientation label to genders.
 #[derive(Deserialize, ToSchema)]
 pub struct ProfileBody {
+    /// A free-form label, matched case-insensitively: trimmed and stored lowercase.
     pub gender: String,
+    /// Labels in the same vocabulary as `gender`; each is trimmed and stored lowercase.
     pub seeking_genders: Vec<String>,
     /// Age is derived from this at query time; it is never stored.
     pub birth_date: Option<NaiveDate>,
@@ -37,6 +39,12 @@ pub struct ProfileBody {
 
 fn blank(s: &str) -> bool {
     s.trim().is_empty()
+}
+
+/// The hard filter compares gender labels exactly in SQL, so they are
+/// normalised once, here.
+fn label(s: &str) -> String {
+    s.trim().to_lowercase()
 }
 
 fn validate(b: ProfileBody) -> Result<ProfileWrite, AppError> {
@@ -57,12 +65,8 @@ fn validate(b: ProfileBody) -> Result<ProfileWrite, AppError> {
     }
     let trim = |s: Option<String>| s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     Ok(ProfileWrite {
-        gender: b.gender.trim().to_string(),
-        seeking_genders: b
-            .seeking_genders
-            .iter()
-            .map(|g| g.trim().to_string())
-            .collect(),
+        gender: label(&b.gender),
+        seeking_genders: b.seeking_genders.iter().map(|g| label(g)).collect(),
         birth_date: b.birth_date,
         country: trim(b.country),
         region: trim(b.region),
@@ -181,26 +185,56 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
 
-        let row = crate::db::profiles::load(&pool, id).await.unwrap().unwrap();
-        assert_eq!(row.gender, "f");
-        assert_eq!(row.seeking_genders, vec!["m"]);
-        assert!(row.active);
-        assert_eq!(row.city.as_deref(), Some("Singapore"));
+        let first = crate::db::profiles::load(&pool, id).await.unwrap().unwrap();
+        assert_eq!(first.gender, "f");
+        assert_eq!(first.seeking_genders, vec!["m"]);
+        assert_eq!(
+            first.birth_date,
+            Some(chrono::NaiveDate::from_ymd_opt(1996, 4, 2).unwrap())
+        );
+        assert_eq!(first.country.as_deref(), Some("SG"));
+        assert!(first.region.is_none());
+        assert_eq!(first.city.as_deref(), Some("Singapore"));
+        assert!(first.active);
 
-        let mut again = valid();
-        again["active"] = serde_json::json!(false);
-        again["city"] = serde_json::Value::Null;
+        // The second PUT changes gender, seeking_genders and country, and drops
+        // region (never set), birth_date and city. Padding, case and a blank
+        // string are normalised on the way in.
+        let second_body = serde_json::json!({
+            "gender": "M",
+            "seeking_genders": [" F "],
+            "birth_date": null,
+            "country": "JP",
+            "city": "  ",
+            "active": false
+        });
         let (status, _) = send(
             pool.clone(),
             "PUT",
             &format!("/v1/profiles/{id}"),
-            Some(again),
+            Some(second_body),
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
-        let row = crate::db::profiles::load(&pool, id).await.unwrap().unwrap();
-        assert!(!row.active);
-        assert!(row.city.is_none(), "PUT replaces the whole row");
+
+        let second = crate::db::profiles::load(&pool, id).await.unwrap().unwrap();
+        assert_eq!(second.gender, "m", "stored lowercase");
+        assert_eq!(second.seeking_genders, vec!["f"], "trimmed and lowercase");
+        assert!(second.birth_date.is_none(), "PUT replaces the whole row");
+        assert_eq!(second.country.as_deref(), Some("JP"));
+        assert!(second.region.is_none());
+        assert!(second.city.is_none(), "blank string is stored as NULL");
+        assert!(!second.active);
+        assert!(second.updated_at > first.updated_at);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn put_accepts_a_birth_date_of_today(pool: sqlx::PgPool) {
+        let id = Uuid::new_v4();
+        let mut b = valid();
+        b["birth_date"] = serde_json::json!(chrono::Utc::now().date_naive().to_string());
+        let (status, _) = send(pool.clone(), "PUT", &format!("/v1/profiles/{id}"), Some(b)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -240,19 +274,30 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "not_in_pool");
 
-        send(
-            pool.clone(),
-            "PUT",
-            &format!("/v1/profiles/{id}"),
-            Some(valid()),
-        )
-        .await;
+        let other = Uuid::new_v4();
+        for who in [id, other] {
+            let (status, _) = send(
+                pool.clone(),
+                "PUT",
+                &format!("/v1/profiles/{who}"),
+                Some(valid()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
         let (status, _) = send(pool.clone(), "DELETE", &format!("/v1/profiles/{id}"), None).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert!(crate::db::profiles::load(&pool, id)
             .await
             .unwrap()
             .is_none());
+        assert!(
+            crate::db::profiles::load(&pool, other)
+                .await
+                .unwrap()
+                .is_some(),
+            "DELETE removes only the addressed user"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
