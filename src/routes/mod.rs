@@ -53,6 +53,9 @@ mod tests {
         ] {
             assert!(v["paths"][p].is_object(), "{p}");
         }
-        assert!(v["components"]["securitySchemes"]["caller_secret"].is_object());
+        let scheme = &v["components"]["securitySchemes"]["caller_secret"];
+        assert!(scheme.is_object());
+        assert_eq!(scheme["name"], "x-pothos-caller-secret");
+        assert_eq!(scheme["in"], "header");
     }
 }

@@ -20,14 +20,14 @@ The sweeper polls the engine every `SWEEP_INTERVAL_SECS`, resuming a few seconds
 
 ```bash
 docker run -d --name pothos-pg -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=pothos postgres:16
-cp .env.example .env            # fill DATABASE_URL, POTHOS_CALLER_SECRET, ENGINE_*
+cp .env.example .env            # fill `DATABASE_URL` and `POTHOS_CALLER_SECRET`; `ENGINE_*` only if you want the sweeper
 cargo run -- migrate
 cargo run -- serve
 ```
 
 `migrate` must run on a direct connection, not through a transaction pooler — it sets `search_path` as a startup parameter so the migrator's bookkeeping table lands in the `pothos` schema.
 
-Without `ENGINE_BASE_URL` / `ENGINE_EXPORT_SECRET` the sweeper stays off and the service ranks whatever is already mirrored.
+Without both `ENGINE_BASE_URL` and `ENGINE_EXPORT_SECRET` the sweeper stays off; setting only one refuses boot. The service then ranks whatever is already mirrored.
 
 ## API
 
@@ -36,7 +36,7 @@ Every `/v1/*` call needs `x-pothos-caller-secret: <POTHOS_CALLER_SECRET>`. This 
 ```
 PUT    /v1/profiles/{user_id}             push hard attributes (creates pool membership)
 DELETE /v1/profiles/{user_id}             leave the pool
-GET    /v1/match/candidates/{user_id}     ranked candidates, limit 1..=100 (default 20)
+GET    /v1/match/candidates/{user_id}     ranked candidates, limit clamped to 1..=100 (default 20)
 GET    /healthz                           public
 ```
 
@@ -48,6 +48,8 @@ GET    /healthz                           public
 ```
 
 `seeking_genders` is already expanded by the caller — this service never maps an orientation label to genders; that is a cultural and product decision, not an engine's. `gender` and `seeking_genders` are case-insensitive labels, stored lowercase.
+
+`active: false` keeps the row but takes the user out of the pool: they drop out of everyone's candidates and get `404 not_in_pool` from `/v1/match/candidates`. `DELETE` of a non-member is also `404 not_in_pool`.
 
 `GET /v1/match/candidates/{user_id}` response:
 
@@ -69,18 +71,18 @@ Weights live in `pothos.toml`. The OpenAPI document: `cargo run -- print-openapi
 
 ## Configuration
 
-See [`.env.example`](.env.example). Secrets are at least 32 bytes; a shorter one refuses boot.
+See [`.env.example`](.env.example). `POTHOS_CALLER_SECRET` must be at least 32 bytes; a shorter one refuses boot.
 
 ## Development
 
 ```bash
-createdb pothos_test
+createdb -h localhost -U postgres pothos_test
 export DATABASE_URL=postgres://postgres:postgres@localhost:5432/pothos_test
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-`cargo test` needs the database named in `DATABASE_URL` to exist (`createdb pothos_test`); the harness creates throwaway databases on that server.
+`cargo test` needs the database named in `DATABASE_URL` to exist (the `createdb` above); the harness creates throwaway databases on that server.
 
 ## License
 

@@ -1,6 +1,6 @@
 # pothos-heart
 
-Open-source matchmaking engine (MIT). Companion of `eros-engine`; shares a tree with it under `oss-eros/`, inherits that tree's `CLAUDE.md`.
+Open-source matchmaking engine (MIT). Companion of `eros-engine`; the two talk HTTP only.
 
 ## Three rules
 
