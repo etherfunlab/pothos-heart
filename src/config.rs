@@ -198,8 +198,6 @@ impl Weights {
     }
 
     /// Divisor that maps the weighted sum onto [0, 1].
-    // used by scoring in Task 5
-    #[allow(dead_code)]
     pub fn total(&self) -> f64 {
         self.interests + self.personality_traits + self.geo
     }
