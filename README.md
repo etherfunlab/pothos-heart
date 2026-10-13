@@ -31,7 +31,7 @@ cargo run -- serve
 
 Without both `ENGINE_BASE_URL` and `ENGINE_EXPORT_SECRET` the sweeper stays off; setting only one refuses boot. The service then ranks whatever is already mirrored.
 
-The sweeper needs an eros-engine build that serves `GET /svc/v1/insights/changes` ([eros-engine PR #406](https://github.com/etherfunlab/eros-engine/pull/406)), with `INSIGHTS_EXPORT_SECRET` set on the engine (at least 32 bytes) to the same value as `ENGINE_EXPORT_SECRET` here.
+The sweeper needs [eros-engine](https://github.com/etherfunlab/eros-engine) **v2.2.0 or later**, which serves `GET /svc/v1/insights/changes`, with `INSIGHTS_EXPORT_SECRET` set on the engine (at least 32 bytes) to the same value as `ENGINE_EXPORT_SECRET` here.
 
 ## API
 
