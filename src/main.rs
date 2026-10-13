@@ -5,6 +5,8 @@
 mod auth;
 mod config;
 mod db;
+#[allow(dead_code)] // consumed by Task 10
+mod engine_client;
 mod error;
 mod routes;
 mod scoring;

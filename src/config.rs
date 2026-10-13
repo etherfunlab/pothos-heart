@@ -12,8 +12,6 @@ pub const MIN_CALLER_SECRET_LEN: usize = 32;
 #[derive(Clone)]
 pub struct EngineConfig {
     pub base_url: String,
-    // read by the engine client in Task 9
-    #[allow(dead_code)]
     pub export_secret: String,
 }
 
