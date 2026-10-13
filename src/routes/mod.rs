@@ -9,11 +9,12 @@ use crate::auth::require_caller_secret;
 use crate::state::AppState;
 
 pub mod health;
+pub mod profiles;
 
 /// Every `/v1` route is merged here, before the caller-secret layer is applied
 /// in `router()` — a route added after `.layer` would bypass auth.
 fn v1_routes() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new()
+    OpenApiRouter::new().merge(profiles::router())
 }
 
 pub fn router(state: AppState) -> OpenApiRouter<AppState> {

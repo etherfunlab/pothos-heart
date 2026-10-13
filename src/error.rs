@@ -9,11 +9,8 @@ use serde_json::json;
 pub enum AppError {
     #[error("caller secret missing or wrong")]
     Forbidden,
-    // constructed by the profile and candidate handlers in Tasks 6 and 8
-    #[allow(dead_code)]
     #[error("{0}")]
     BadRequest(String),
-    #[allow(dead_code)]
     #[error("user is not in the match pool")]
     NotInPool,
     #[error("database error")]

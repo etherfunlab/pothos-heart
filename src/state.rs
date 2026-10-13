@@ -6,8 +6,6 @@ use crate::config::{Config, Weights};
 
 #[derive(Clone)]
 pub struct AppState {
-    // read by the repo and handlers from Task 6 on
-    #[allow(dead_code)]
     pub pool: PgPool,
     pub config: Arc<Config>,
     // read by scoring in Task 8

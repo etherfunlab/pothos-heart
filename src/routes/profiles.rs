@@ -1,0 +1,268 @@
+//! Hard attributes, pushed by the product layer. The row's existence with
+//! `active = true` is the pool membership.
+
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::Json;
+use chrono::NaiveDate;
+use serde::Deserialize;
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
+use uuid::Uuid;
+
+use crate::db::profiles::{self, ProfileWrite};
+use crate::error::AppError;
+use crate::state::AppState;
+
+fn default_true() -> bool {
+    true
+}
+
+/// Hard attributes for one user. `seeking_genders` is already expanded by the
+/// product layer ("who I am looking for"); this service never maps an
+/// orientation label to genders.
+#[derive(Deserialize, ToSchema)]
+pub struct ProfileBody {
+    pub gender: String,
+    pub seeking_genders: Vec<String>,
+    /// Age is derived from this at query time; it is never stored.
+    pub birth_date: Option<NaiveDate>,
+    pub country: Option<String>,
+    pub region: Option<String>,
+    pub city: Option<String>,
+    /// `false` keeps the row but takes the user out of the pool.
+    #[serde(default = "default_true")]
+    pub active: bool,
+}
+
+fn blank(s: &str) -> bool {
+    s.trim().is_empty()
+}
+
+fn validate(b: ProfileBody) -> Result<ProfileWrite, AppError> {
+    if blank(&b.gender) {
+        return Err(AppError::BadRequest("gender must not be blank".into()));
+    }
+    if b.seeking_genders.is_empty() || b.seeking_genders.iter().any(|g| blank(g)) {
+        return Err(AppError::BadRequest(
+            "seeking_genders must be a non-empty list of non-blank values".into(),
+        ));
+    }
+    if let Some(d) = b.birth_date {
+        if d > chrono::Utc::now().date_naive() {
+            return Err(AppError::BadRequest(
+                "birth_date must not be in the future".into(),
+            ));
+        }
+    }
+    let trim = |s: Option<String>| s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    Ok(ProfileWrite {
+        gender: b.gender.trim().to_string(),
+        seeking_genders: b
+            .seeking_genders
+            .iter()
+            .map(|g| g.trim().to_string())
+            .collect(),
+        birth_date: b.birth_date,
+        country: trim(b.country),
+        region: trim(b.region),
+        city: trim(b.city),
+        active: b.active,
+    })
+}
+
+/// Push (or replace) a user's hard attributes. Creating the row admits the
+/// user to the match pool.
+#[utoipa::path(
+    put,
+    path = "/v1/profiles/{user_id}",
+    tag = "profiles",
+    params(("user_id" = Uuid, Path)),
+    request_body = ProfileBody,
+    responses(
+        (status = 204, description = "stored"),
+        (status = 400, description = "bad_request"),
+        (status = 403, description = "forbidden")
+    ),
+    security(("caller_secret" = []))
+)]
+async fn put_profile(
+    State(state): State<AppState>,
+    Path(user_id): Path<Uuid>,
+    Json(body): Json<ProfileBody>,
+) -> Result<StatusCode, AppError> {
+    let w = validate(body)?;
+    profiles::upsert(&state.pool, user_id, &w).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Remove a user from the match pool.
+#[utoipa::path(
+    delete,
+    path = "/v1/profiles/{user_id}",
+    tag = "profiles",
+    params(("user_id" = Uuid, Path)),
+    responses(
+        (status = 204, description = "removed"),
+        (status = 404, description = "not_in_pool"),
+        (status = 403, description = "forbidden")
+    ),
+    security(("caller_secret" = []))
+)]
+async fn delete_profile(
+    State(state): State<AppState>,
+    Path(user_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    if profiles::delete(&state.pool, user_id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotInPool)
+    }
+}
+
+pub fn router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(put_profile, delete_profile))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Request, StatusCode};
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    use crate::auth::CALLER_SECRET_HEADER;
+    use crate::routes::build_app;
+    use crate::state::{test_state, TEST_SECRET};
+
+    async fn send(
+        pool: sqlx::PgPool,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(CALLER_SECRET_HEADER, TEST_SECRET)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
+            .unwrap();
+        let res = build_app(test_state(pool)).oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = to_bytes(res.into_body(), 1 << 16).await.unwrap();
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, json)
+    }
+
+    fn valid() -> serde_json::Value {
+        serde_json::json!({
+            "gender": "f",
+            "seeking_genders": ["m"],
+            "birth_date": "1996-04-02",
+            "country": "SG",
+            "city": "Singapore"
+        })
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn put_upserts_and_defaults_active_true(pool: sqlx::PgPool) {
+        let id = Uuid::new_v4();
+        let (status, _) = send(
+            pool.clone(),
+            "PUT",
+            &format!("/v1/profiles/{id}"),
+            Some(valid()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let row = crate::db::profiles::load(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.gender, "f");
+        assert_eq!(row.seeking_genders, vec!["m"]);
+        assert!(row.active);
+        assert_eq!(row.city.as_deref(), Some("Singapore"));
+
+        let mut again = valid();
+        again["active"] = serde_json::json!(false);
+        again["city"] = serde_json::Value::Null;
+        let (status, _) = send(
+            pool.clone(),
+            "PUT",
+            &format!("/v1/profiles/{id}"),
+            Some(again),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let row = crate::db::profiles::load(&pool, id).await.unwrap().unwrap();
+        assert!(!row.active);
+        assert!(row.city.is_none(), "PUT replaces the whole row");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn put_rejects_empty_or_blank_seeking_genders_and_blank_gender(pool: sqlx::PgPool) {
+        let id = Uuid::new_v4();
+        for (field, value) in [
+            ("seeking_genders", serde_json::json!([])),
+            ("seeking_genders", serde_json::json!(["m", " "])),
+            ("gender", serde_json::json!("  ")),
+        ] {
+            let mut b = valid();
+            b[field] = value;
+            let (status, body) =
+                send(pool.clone(), "PUT", &format!("/v1/profiles/{id}"), Some(b)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}");
+            assert_eq!(body["error"], "bad_request");
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn put_rejects_a_birth_date_in_the_future(pool: sqlx::PgPool) {
+        let id = Uuid::new_v4();
+        let mut b = valid();
+        let tomorrow = chrono::Utc::now().date_naive() + chrono::Days::new(1);
+        b["birth_date"] = serde_json::json!(tomorrow.to_string());
+        let (status, body) =
+            send(pool.clone(), "PUT", &format!("/v1/profiles/{id}"), Some(b)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["message"].as_str().unwrap().contains("birth_date"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn delete_removes_or_404s(pool: sqlx::PgPool) {
+        let id = Uuid::new_v4();
+        let (status, body) =
+            send(pool.clone(), "DELETE", &format!("/v1/profiles/{id}"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_in_pool");
+
+        send(
+            pool.clone(),
+            "PUT",
+            &format!("/v1/profiles/{id}"),
+            Some(valid()),
+        )
+        .await;
+        let (status, _) = send(pool.clone(), "DELETE", &format!("/v1/profiles/{id}"), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(crate::db::profiles::load(&pool, id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn profiles_require_the_caller_secret(pool: sqlx::PgPool) {
+        let id = Uuid::new_v4();
+        let req = Request::put(format!("/v1/profiles/{id}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(valid().to_string()))
+            .unwrap();
+        let res = build_app(test_state(pool)).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+}

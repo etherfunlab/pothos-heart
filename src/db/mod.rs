@@ -5,6 +5,8 @@
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
+pub mod profiles;
+
 pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new().max_connections(8).connect(url).await
 }
