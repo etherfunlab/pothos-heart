@@ -45,18 +45,25 @@ pub enum EngineError {
 pub struct EngineClient {
     http: reqwest::Client,
     base_url: String,
-    secret: String,
+    secret: reqwest::header::HeaderValue,
 }
 
 impl EngineClient {
     pub fn new(cfg: &EngineConfig) -> Self {
+        let mut secret = reqwest::header::HeaderValue::from_str(&cfg.export_secret)
+            .expect("export secret is valid header text");
+        // Keeps the secret out of reqwest/hyper debug output.
+        secret.set_sensitive(true);
         Self {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
+                // reqwest forwards custom headers on cross-host redirects; a
+                // misconfigured `http://` base must not leak the secret.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("reqwest client"),
             base_url: cfg.base_url.clone(),
-            secret: cfg.export_secret.clone(),
+            secret,
         }
     }
 
@@ -71,7 +78,7 @@ impl EngineClient {
         let res = self
             .http
             .get(format!("{}/svc/v1/insights/changes", self.base_url))
-            .header(EXPORT_SECRET_HEADER, &self.secret)
+            .header(EXPORT_SECRET_HEADER, self.secret.clone())
             .query(&[
                 // AutoSi keeps the engine's microsecond precision; a truncated
                 // `since` would re-return same-second rows (harmless upserts,
@@ -151,13 +158,14 @@ mod tests {
         let r = &page.profiles[0];
         assert_eq!(r.user_id, id);
         assert_eq!(r.interests, vec!["jazz"]);
+        assert_eq!(r.personality_traits, vec!["calm"]);
         assert_eq!(r.deal_breakers, vec!["smoking"]);
         assert_eq!((r.age_min, r.age_max), (Some(25), Some(35)));
-        assert_eq!(
-            r.updated_at,
-            Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap()
-        );
-        assert_eq!(page.next.unwrap().user_id, id);
+        let ts = Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap();
+        assert_eq!(r.updated_at, ts);
+        let next = page.next.unwrap();
+        assert_eq!(next.user_id, id);
+        assert_eq!(next.updated_at, ts);
     }
 
     #[tokio::test]
@@ -197,5 +205,59 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, EngineError::Status(403)));
+    }
+
+    #[tokio::test]
+    async fn since_keeps_microsecond_precision() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(query_param("since", "1970-01-01T00:00:00.123456Z"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "profiles": [], "next": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let since = DateTime::<Utc>::UNIX_EPOCH + chrono::Duration::microseconds(123_456);
+        EngineClient::new(&cfg(&server))
+            .changes(since, Uuid::nil())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn redirects_are_never_followed() {
+        let target = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&target)
+            .await;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/svc/v1/insights/changes"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/elsewhere", target.uri()).as_str()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let err = EngineClient::new(&cfg(&server))
+            .changes(DateTime::<Utc>::UNIX_EPOCH, Uuid::nil())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Status(302)));
+    }
+
+    #[test]
+    fn secret_header_is_marked_sensitive() {
+        let server_cfg = EngineConfig {
+            base_url: "http://engine.invalid".into(),
+            export_secret: "s".repeat(32),
+        };
+        assert!(EngineClient::new(&server_cfg).secret.is_sensitive());
     }
 }
