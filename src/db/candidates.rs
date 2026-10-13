@@ -180,6 +180,58 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn self_is_excluded_even_when_the_gender_rule_would_admit_it(pool: PgPool) {
+        // me and the other user are both "f" seeking "f", so the gender rule
+        // alone would let me match myself; only the id check removes me.
+        let me = profile(&pool, "f", &["f", "m"], None, true).await;
+        let other_f = profile(&pool, "f", &["f"], None, true).await;
+
+        let got = ids(&pool, me).await;
+        assert_eq!(got, vec![other_f]);
+        assert!(!got.contains(&me));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn age_lower_bounds_and_the_candidates_own_range_are_checked_against_the_right_person(
+        pool: PgPool,
+    ) {
+        // me: 29-30 years old, wants 25-35.
+        let me = profile(&pool, "f", &["m"], Some(years_ago(30)), true).await;
+        mirror(&pool, me, &[], &[], &[], Some((25, 35))).await;
+
+        let control = profile(&pool, "m", &["f"], Some(years_ago(28)), true).await;
+
+        // Below MY age_min.
+        let too_young = profile(&pool, "m", &["f"], Some(years_ago(22)), true).await;
+
+        // Inside my range, but I am below HIS age_min; his own age (32-33)
+        // would satisfy his own minimum, so only my age can exclude him.
+        let his_min_above_me = profile(&pool, "m", &["f"], Some(years_ago(33)), true).await;
+        mirror(&pool, his_min_above_me, &[], &[], &[], Some((32, 45))).await;
+
+        // Inside my range, but I am above HIS age_max; his own age (26-27)
+        // would satisfy his own maximum, so only my age can exclude him.
+        let his_max_below_me = profile(&pool, "m", &["f"], Some(years_ago(27)), true).await;
+        mirror(&pool, his_max_below_me, &[], &[], &[], Some((18, 28))).await;
+
+        let got = ids(&pool, me).await;
+        assert_eq!(got, vec![control]);
+        assert!(!got.contains(&too_young));
+        assert!(!got.contains(&his_min_above_me));
+        assert!(!got.contains(&his_max_below_me));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn me_without_birth_date_is_not_excluded_by_a_candidates_age_prefs(pool: PgPool) {
+        let me = profile(&pool, "f", &["m"], None, true).await;
+        mirror(&pool, me, &[], &[], &[], None).await;
+        let him = profile(&pool, "m", &["f"], Some(years_ago(21)), true).await;
+        mirror(&pool, him, &[], &[], &[], Some((18, 24))).await;
+
+        assert_eq!(ids(&pool, me).await, vec![him]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn me_without_age_prefs_does_not_filter_on_age(pool: PgPool) {
         let me = profile(&pool, "f", &["m"], Some(years_ago(30)), true).await;
         mirror(&pool, me, &["jazz"], &[], &[], None).await;
