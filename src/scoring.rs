@@ -129,6 +129,13 @@ mod tests {
         let (oc, shared) = overlap(&a, &b);
         assert_eq!(oc, 1.0, "min-normalised: the newcomer is not punished");
         assert_eq!(shared, v(&["hiking", "jazz"]), "shared items, sorted");
+
+        let (oc_rev, shared_rev) = overlap(&b, &a);
+        assert_eq!(oc_rev, oc, "argument order does not change the coefficient");
+        assert_eq!(
+            shared_rev, shared,
+            "argument order does not change shared items"
+        );
     }
 
     #[test]
@@ -242,5 +249,160 @@ mod tests {
 
         let perfect = score(&w, &me, &me);
         assert!((perfect.score - 1.0).abs() < 1e-9);
+    }
+
+    fn sg_home() -> Geo<'static> {
+        Geo {
+            country: Some("SG"),
+            region: Some("Central"),
+            city: Some("Singapore"),
+        }
+    }
+
+    #[test]
+    fn geo_levels_flow_through_score() {
+        let w = Weights::default(); // geo levels 1.0 / 0.6 / 0.3
+        let ints = v(&["jazz", "hiking"]);
+        let trs = v(&["calm"]);
+        let me = Side {
+            interests: &ints,
+            traits: &trs,
+            geo: sg_home(),
+        };
+        let cases = [
+            (
+                "region only",
+                Geo {
+                    country: Some("SG"),
+                    region: Some("Central"),
+                    city: Some("Jurong"),
+                },
+                0.6,
+                Some(GeoMatch::Region),
+            ),
+            (
+                "country only",
+                Geo {
+                    country: Some("SG"),
+                    region: Some("East"),
+                    city: Some("Changi"),
+                },
+                0.3,
+                Some(GeoMatch::Country),
+            ),
+            (
+                "no country match",
+                Geo {
+                    country: Some("MY"),
+                    region: Some("Central"),
+                    city: Some("Singapore"),
+                },
+                0.0,
+                None,
+            ),
+        ];
+        for (name, geo, level, gm) in cases {
+            let other = Side {
+                interests: &ints,
+                traits: &trs,
+                geo,
+            };
+            let s = score(&w, &me, &other);
+            assert!(
+                (s.scores.geo - level).abs() < 1e-9,
+                "{name}: geo {}",
+                s.scores.geo
+            );
+            assert_eq!(s.geo_match, gm, "{name}");
+            // identical interests and traits: 0.5 * 1.0 + 0.3 * 1.0 + 0.2 * level
+            let expected = 0.8 + 0.2 * level;
+            assert!(
+                (s.score - expected).abs() < 1e-9,
+                "{name}: score {}",
+                s.score
+            );
+        }
+    }
+
+    #[test]
+    fn score_normalises_by_weight_total_not_by_one() {
+        let ints_a = v(&["jazz", "hiking"]);
+        let ints_b = v(&["jazz", "tea"]);
+        let trs_a = v(&["calm"]);
+        let trs_b = v(&["loud"]);
+        let me = Side {
+            interests: &ints_a,
+            traits: &trs_a,
+            geo: sg_home(),
+        };
+        let other = Side {
+            interests: &ints_b,
+            traits: &trs_b,
+            geo: sg_home(),
+        };
+        let default = Weights::default();
+        let custom = Weights {
+            interests: 2.0,
+            personality_traits: 1.2,
+            geo: 0.8,
+            geo_levels: crate::config::GeoLevels {
+                city: 1.0,
+                region: 0.6,
+                country: 0.3,
+            },
+        };
+        let s_default = score(&default, &me, &other).score;
+        let s_custom = score(&custom, &me, &other).score;
+        // (2.0 * 0.5 + 1.2 * 0 + 0.8 * 1.0) / 4.0 = 0.45, same as the default
+        assert!(
+            (s_custom - s_default).abs() < 1e-9,
+            "{s_custom} vs {s_default}"
+        );
+        assert!((s_custom - 0.45).abs() < 1e-9);
+        assert!((score(&custom, &me, &me).score - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn overlap_denominator_uses_deduped_size() {
+        let (oc, shared) = overlap(&v(&["Jazz", "jazz"]), &v(&["jazz", "tea"]));
+        assert_eq!(oc, 1.0, "deduped a has size 1; raw length would give 0.5");
+        assert_eq!(shared, v(&["jazz"]));
+    }
+
+    #[test]
+    fn overlap_trims_and_drops_blank_entries() {
+        assert_eq!(overlap(&v(&[" jazz "]), &v(&["jazz"])), (1.0, v(&["jazz"])));
+        assert_eq!(
+            overlap(&v(&["", "  "]), &v(&["", "jazz"])),
+            (0.0, Vec::new()),
+            "blank entries are never shared"
+        );
+    }
+
+    #[test]
+    fn serde_output_uses_lowercase_geo_match_and_null_when_no_country() {
+        assert_eq!(serde_json::to_value(GeoMatch::City).unwrap(), "city");
+        assert_eq!(serde_json::to_value(GeoMatch::Region).unwrap(), "region");
+        assert_eq!(serde_json::to_value(GeoMatch::Country).unwrap(), "country");
+
+        let w = Weights::default();
+        let ints = v(&["jazz"]);
+        let trs = v(&["calm"]);
+        let me = Side {
+            interests: &ints,
+            traits: &trs,
+            geo: sg_home(),
+        };
+        let other = Side {
+            interests: &ints,
+            traits: &trs,
+            geo: Geo {
+                country: Some("MY"),
+                region: Some("Central"),
+                city: Some("Singapore"),
+            },
+        };
+        let json = serde_json::to_value(score(&w, &me, &other)).unwrap();
+        assert!(json["geo_match"].is_null(), "{json}");
     }
 }
