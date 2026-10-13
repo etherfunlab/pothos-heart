@@ -29,6 +29,9 @@ pub async fn migrate(url: &str) -> Result<(), Box<dyn std::error::Error>> {
         .max_connections(1)
         .connect_with(opts)
         .await?;
+    // Load-bearing: the migrator creates its bookkeeping table before migration
+    // 0001 runs. Without the `pothos` schema, Postgres skips the missing
+    // `search_path` entry and the table lands in `public`.
     sqlx::query("CREATE SCHEMA IF NOT EXISTS pothos")
         .execute(&pool)
         .await?;

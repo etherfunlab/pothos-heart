@@ -26,8 +26,6 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
 }
 
 /// Same shape without the auth layer or a live state — for `print-openapi`.
-// wired by print-openapi in Task 11
-#[allow(dead_code)]
 pub fn router_for_openapi() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .merge(health::router())
@@ -37,4 +35,24 @@ pub fn router_for_openapi() -> OpenApiRouter<AppState> {
 pub fn build_app(state: AppState) -> Router {
     let (router, _api) = router(state.clone()).split_for_parts();
     router.with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn openapi_lists_the_three_v1_routes_and_healthz() {
+        use utoipa::OpenApi;
+        let (_r, api) = super::router_for_openapi().split_for_parts();
+        let mut doc = crate::openapi::ApiDoc::openapi();
+        doc.merge(api);
+        let v = serde_json::to_value(doc).unwrap();
+        for p in [
+            "/healthz",
+            "/v1/profiles/{user_id}",
+            "/v1/match/candidates/{user_id}",
+        ] {
+            assert!(v["paths"][p].is_object(), "{p}");
+        }
+        assert!(v["components"]["securitySchemes"]["caller_secret"].is_object());
+    }
 }

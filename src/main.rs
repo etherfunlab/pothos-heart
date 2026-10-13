@@ -7,6 +7,7 @@ mod config;
 mod db;
 mod engine_client;
 mod error;
+mod openapi;
 mod routes;
 mod scoring;
 mod state;
@@ -27,6 +28,10 @@ async fn main() {
     let result = match cmd.as_str() {
         "migrate" => run_migrate().await,
         "serve" => run_serve().await,
+        "print-openapi" => {
+            run_print_openapi();
+            Ok(())
+        }
         other => {
             eprintln!(
                 "unknown subcommand {other}; usage: pothos-heart [serve|migrate|print-openapi]"
@@ -38,6 +43,17 @@ async fn main() {
         tracing::error!(error = %e, "fatal");
         std::process::exit(1);
     }
+}
+
+fn run_print_openapi() {
+    use utoipa::OpenApi;
+    let (_router, api) = routes::router_for_openapi().split_for_parts();
+    let mut doc = openapi::ApiDoc::openapi();
+    doc.merge(api);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&doc).expect("openapi serialises")
+    );
 }
 
 async fn run_migrate() -> Result<(), Box<dyn std::error::Error>> {

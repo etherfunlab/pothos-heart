@@ -1,0 +1,87 @@
+# pothos-heart
+
+An open-source matchmaking engine. It reads what an AI companion has learned about a person and ranks the real people who could meet them — with the reason attached.
+
+- **Hard filter in SQL**: bidirectional gender, bidirectional age window, bidirectional deal-breakers. Missing data never excludes anyone.
+- **Soft score in Rust**: overlap coefficient per dimension (`|A∩B| / min(|A|,|B|)`), geo by level, weighted into `[0, 1]`. Every candidate comes back with the shared items that produced the score.
+- **Nothing persisted about matches.** The ranking is computed on request from two read-only mirrors. "Seen / skipped / matched" is the product layer's state.
+- **No LLM.** Not yet.
+
+Two inputs, two mirrors:
+
+| Mirror | Source | How it arrives |
+|---|---|---|
+| `pothos.insight_mirror` | an [eros-engine](https://github.com/etherfunlab/eros-engine) deployment's `GET /svc/v1/insights/changes` | pulled by the built-in sweeper |
+| `pothos.match_profiles` | the product layer's self-filled profile (gender, who they seek, birth date, country / region / city) | pushed via `PUT /v1/profiles/{user_id}` |
+
+The sweeper polls the engine every `SWEEP_INTERVAL_SECS`, resuming a few seconds behind the last row it stored (the engine stamps `updated_at` when a write starts but the row is visible only at commit). Re-fetched rows are idempotent upserts. Array values are stored trimmed and lowercase.
+
+## Run it
+
+```bash
+docker run -d --name pothos-pg -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=pothos postgres:16
+cp .env.example .env            # fill DATABASE_URL, POTHOS_CALLER_SECRET, ENGINE_*
+cargo run -- migrate
+cargo run -- serve
+```
+
+`migrate` must run on a direct connection, not through a transaction pooler — it sets `search_path` as a startup parameter so the migrator's bookkeeping table lands in the `pothos` schema.
+
+Without `ENGINE_BASE_URL` / `ENGINE_EXPORT_SECRET` the sweeper stays off and the service ranks whatever is already mirrored.
+
+## API
+
+Every `/v1/*` call needs `x-pothos-caller-secret: <POTHOS_CALLER_SECRET>`. This is a service-to-service API: end users never call it, and their identity system is not this service's business.
+
+```
+PUT    /v1/profiles/{user_id}             push hard attributes (creates pool membership)
+DELETE /v1/profiles/{user_id}             leave the pool
+GET    /v1/match/candidates/{user_id}     ranked candidates, limit 1..=100 (default 20)
+GET    /healthz                           public
+```
+
+`PUT /v1/profiles/{user_id}` body:
+
+```json
+{ "gender": "f", "seeking_genders": ["m"], "birth_date": "1996-04-02",
+  "country": "SG", "region": null, "city": "Singapore", "active": true }
+```
+
+`seeking_genders` is already expanded by the caller — this service never maps an orientation label to genders; that is a cultural and product decision, not an engine's. `gender` and `seeking_genders` are case-insensitive labels, stored lowercase.
+
+`GET /v1/match/candidates/{user_id}` response:
+
+```json
+{
+  "user_id": "…",
+  "reason": null,
+  "candidates": [
+    { "user_id": "…", "score": 0.73,
+      "scores": { "interests": 1.0, "personality_traits": 0.5, "geo": 1.0 },
+      "shared_interests": ["hiking", "jazz"], "shared_traits": ["calm"], "geo_match": "city" }
+  ]
+}
+```
+
+`reason` is `"no_insights_yet"` (with an empty list) when the user is in the pool but the engine has not produced a profile for them yet. A user who was never pushed is `404 not_in_pool`.
+
+Weights live in `pothos.toml`. The OpenAPI document: `cargo run -- print-openapi`.
+
+## Configuration
+
+See [`.env.example`](.env.example). Secrets are at least 32 bytes; a shorter one refuses boot.
+
+## Development
+
+```bash
+createdb pothos_test
+export DATABASE_URL=postgres://postgres:postgres@localhost:5432/pothos_test
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
+
+`cargo test` needs the database named in `DATABASE_URL` to exist (`createdb pothos_test`); the harness creates throwaway databases on that server.
+
+## License
+
+MIT.
