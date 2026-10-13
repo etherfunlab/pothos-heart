@@ -2,12 +2,14 @@
 //!
 //! Subcommands: `serve` (default) · `migrate` · `print-openapi`.
 
-#[allow(dead_code)]
+mod auth;
 mod config;
-#[allow(dead_code)]
 mod db;
-#[allow(dead_code)]
+mod error;
 mod routes;
+mod state;
+
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
@@ -21,10 +23,7 @@ async fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_else(|| "serve".into());
     let result = match cmd.as_str() {
         "migrate" => run_migrate().await,
-        "serve" => {
-            eprintln!("serve: not wired yet");
-            Ok(())
-        }
+        "serve" => run_serve().await,
         other => {
             eprintln!(
                 "unknown subcommand {other}; usage: pothos-heart [serve|migrate|print-openapi]"
@@ -42,5 +41,21 @@ async fn run_migrate() -> Result<(), Box<dyn std::error::Error>> {
     let url = std::env::var("DATABASE_URL")?;
     db::migrate(&url).await?;
     tracing::info!("migrations applied");
+    Ok(())
+}
+
+async fn run_serve() -> Result<(), Box<dyn std::error::Error>> {
+    let config = config::Config::from_env()?;
+    let weights = config::Weights::load(&config.weights_path)?;
+    let pool = db::connect(&config.database_url).await?;
+    let state = state::AppState {
+        pool,
+        config: Arc::new(config.clone()),
+        weights: Arc::new(weights),
+    };
+    let app = routes::build_app(state);
+    let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
+    tracing::info!(addr = %config.bind_addr, "pothos-heart listening");
+    axum::serve(listener, app).await?;
     Ok(())
 }

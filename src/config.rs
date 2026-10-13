@@ -12,6 +12,8 @@ pub const MIN_CALLER_SECRET_LEN: usize = 32;
 #[derive(Clone)]
 pub struct EngineConfig {
     pub base_url: String,
+    // read by the engine client in Task 9
+    #[allow(dead_code)]
     pub export_secret: String,
 }
 
@@ -196,6 +198,8 @@ impl Weights {
     }
 
     /// Divisor that maps the weighted sum onto [0, 1].
+    // used by scoring in Task 5
+    #[allow(dead_code)]
     pub fn total(&self) -> f64 {
         self.interests + self.personality_traits + self.geo
     }
