@@ -4,7 +4,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-// read by the candidate handler in Task 8; the route tests read it back today
+// Whole-row read model: the match handler reads only the geo columns and `active`.
 #[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct MatchProfile {
@@ -65,8 +65,6 @@ pub async fn delete(pool: &PgPool, user_id: Uuid) -> sqlx::Result<bool> {
     Ok(n > 0)
 }
 
-// read by the candidate handler in Task 8
-#[allow(dead_code)]
 pub async fn load(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Option<MatchProfile>> {
     sqlx::query_as::<_, MatchProfile>(
         "SELECT user_id, gender, seeking_genders, birth_date, country, region, city, active, updated_at \

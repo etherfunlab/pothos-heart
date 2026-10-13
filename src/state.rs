@@ -8,8 +8,6 @@ use crate::config::{Config, Weights};
 pub struct AppState {
     pub pool: PgPool,
     pub config: Arc<Config>,
-    // read by scoring in Task 8
-    #[allow(dead_code)]
     pub weights: Arc<Weights>,
 }
 

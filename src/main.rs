@@ -7,7 +7,6 @@ mod config;
 mod db;
 mod error;
 mod routes;
-#[allow(dead_code)] // consumed by Task 8
 mod scoring;
 mod state;
 

@@ -3,8 +3,6 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-// consumed by Task 8
-#[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct CandidateRow {
     pub user_id: Uuid,
@@ -19,8 +17,6 @@ pub struct CandidateRow {
 /// data never excludes: an age rule only fires when the preference and the
 /// birth date both exist; a candidate without a mirror row is kept with empty
 /// arrays. Geo is not a filter. Returns nothing if `me` has no profile row.
-// consumed by Task 8
-#[allow(dead_code)]
 pub async fn hard_filtered(pool: &PgPool, me: Uuid) -> sqlx::Result<Vec<CandidateRow>> {
     sqlx::query_as::<_, CandidateRow>(
         "WITH me AS ( \

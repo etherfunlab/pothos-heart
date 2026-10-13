@@ -11,6 +11,7 @@ use utoipa::ToSchema;
 
 use crate::config::Weights;
 
+/// Finest geographic level at which two users match; present only when the country matches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum GeoMatch {
@@ -32,6 +33,7 @@ pub struct Side<'a> {
     pub geo: Geo<'a>,
 }
 
+/// Per-dimension scores before weighting; `geo` is the configured credit for the matched level.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DimScores {
     pub interests: f64,
@@ -39,6 +41,7 @@ pub struct DimScores {
     pub geo: f64,
 }
 
+/// A weighted match score with its per-dimension breakdown and the shared items behind it.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct Scored {
     pub score: f64,

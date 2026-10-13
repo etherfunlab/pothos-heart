@@ -6,8 +6,6 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-// consumed by Task 8
-#[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct MirrorRow {
     pub user_id: Uuid,
@@ -19,8 +17,6 @@ pub struct MirrorRow {
     pub engine_updated_at: DateTime<Utc>,
 }
 
-// consumed by Task 8
-#[allow(dead_code)]
 pub async fn load(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Option<MirrorRow>> {
     sqlx::query_as::<_, MirrorRow>(
         "SELECT user_id, interests, personality_traits, deal_breakers, age_min, age_max, engine_updated_at \
