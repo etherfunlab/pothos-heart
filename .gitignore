@@ -1,3 +1,5 @@
 /target
 .env
 .DS_Store
+# Local working notes (specs and plans live in the private docs repo).
+docs/superpowers/
