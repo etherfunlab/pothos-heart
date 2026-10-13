@@ -3,6 +3,8 @@
 //! Subcommands: `serve` (default) · `migrate` · `print-openapi`.
 
 #[allow(dead_code)]
+mod config;
+#[allow(dead_code)]
 mod db;
 #[allow(dead_code)]
 mod routes;

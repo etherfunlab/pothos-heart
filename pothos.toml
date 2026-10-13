@@ -1,0 +1,13 @@
+# Soft-score weights. Overlap coefficient per array dimension, geo by level;
+# the weighted sum is divided by the weight total, so score ∈ [0, 1].
+# Starting values — tune against real reads, not against this week's users.
+[weights]
+interests = 0.5
+personality_traits = 0.3
+geo = 0.2
+
+# Credit for the finest matching geo level. Country must match for any credit.
+[geo]
+city = 1.0
+region = 0.6
+country = 0.3
