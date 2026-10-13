@@ -51,7 +51,7 @@ pub struct Scored {
     pub geo_match: Option<GeoMatch>,
 }
 
-fn canon(s: &str) -> Option<String> {
+pub(crate) fn canon(s: &str) -> Option<String> {
     let c = s.trim().to_lowercase();
     (!c.is_empty()).then_some(c)
 }

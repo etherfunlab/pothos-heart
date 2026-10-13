@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::db::mirror::{self, MirrorRow};
 use crate::engine_client::{EngineClient, EngineError, ExportRow};
+use crate::scoring;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SweepError {
@@ -19,15 +20,14 @@ pub enum SweepError {
     Db(#[from] sqlx::Error),
 }
 
-/// Trim, lowercase, drop empties and repeats (first occurrence wins). The SQL
-/// hard filter compares these arrays with exact `&&` and the scorer lowercases
-/// the same way, while engine values are LLM-extracted with varying case.
+/// Canonical labels (`scoring::canon`: trimmed, lowercase, non-empty), repeats
+/// dropped, first occurrence wins. The SQL hard filter compares these arrays
+/// with exact `&&`, so the mirror must hold the same form the scorer reads.
 fn canonical(values: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(values.len());
-    for v in values {
-        let v = v.trim().to_lowercase();
-        if !v.is_empty() && !out.contains(&v) {
-            out.push(v);
+    for c in values.iter().filter_map(|v| scoring::canon(v)) {
+        if !out.contains(&c) {
+            out.push(c);
         }
     }
     out
@@ -69,10 +69,14 @@ pub async fn run_once(pool: &PgPool, client: &EngineClient) -> Result<usize, Swe
         let rows: Vec<MirrorRow> = page.profiles.iter().map(MirrorRow::from).collect();
         mirror::apply_page(pool, &rows).await?;
         total += rows.len();
-        match page.next {
-            Some(next) => (since, after_user) = (next.updated_at, next.user_id),
-            None => break,
+        let Some(next) = page.next else { break };
+        // A conforming engine's `next` is always strictly past the request
+        // position; anything else would re-fetch the same page forever.
+        if (next.updated_at, next.user_id) <= (since, after_user) {
+            tracing::warn!(?next, "engine export cursor did not advance; ending sweep");
+            break;
         }
+        (since, after_user) = (next.updated_at, next.user_id);
     }
     Ok(total)
 }
@@ -84,7 +88,9 @@ pub async fn run_loop(pool: PgPool, client: EngineClient, interval: Duration) {
         match run_once(&pool, &client).await {
             Ok(n) if n > 0 => tracing::info!(rows = n, "mirror sweep"),
             Ok(_) => tracing::debug!("mirror sweep: nothing new"),
-            Err(e) => tracing::warn!(error = %e, "mirror sweep failed; cursor unchanged"),
+            Err(e) => {
+                tracing::warn!(error = %e, "mirror sweep failed; cursor kept at last landed page")
+            }
         }
         tokio::time::sleep(interval).await;
     }
@@ -126,6 +132,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/svc/v1/insights/changes"))
+            .and(query_param("since", "1970-01-01T00:00:00Z"))
             .and(query_param(
                 "after_user",
                 "00000000-0000-0000-0000-000000000000",
@@ -138,6 +145,7 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
+            .and(query_param("since", t1))
             .and(query_param("after_user", b.to_string().as_str()))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "profiles": [row(c, t2, &["chess"])],
@@ -235,6 +243,7 @@ mod tests {
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
         let t1 = "2026-10-13T12:00:00Z";
         Mock::given(method("GET"))
+            .and(query_param("since", "1970-01-01T00:00:00Z"))
             .and(query_param(
                 "after_user",
                 "00000000-0000-0000-0000-000000000000",
@@ -246,6 +255,7 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
+            .and(query_param("since", t1))
             .and(query_param("after_user", a.to_string().as_str()))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
@@ -270,16 +280,74 @@ mod tests {
         let a = Uuid::new_v4();
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "profiles": [row(a, "2026-10-13T12:00:00Z", &["Jazz", " jazz ", "Hiking", ""])],
+                "profiles": [{
+                    "user_id": a,
+                    "interests": ["Jazz", " jazz ", "Hiking", "", "   "],
+                    "personality_traits": ["Calm", " calm "],
+                    "deal_breakers": ["Smoking", "   ", "smoking"],
+                    "age_min": null, "age_max": null,
+                    "updated_at": "2026-10-13T12:00:00Z"
+                }],
                 "next": null
             })))
             .mount(&server)
             .await;
 
         run_once(&pool, &client(&server)).await.unwrap();
-        assert_eq!(
-            mirror::load(&pool, a).await.unwrap().unwrap().interests,
-            vec!["jazz", "hiking"]
-        );
+        let m = mirror::load(&pool, a).await.unwrap().unwrap();
+        assert_eq!(m.interests, vec!["jazz", "hiking"]);
+        assert_eq!(m.personality_traits, vec!["calm"]);
+        assert_eq!(m.deal_breakers, vec!["smoking"]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_failing_cursor_update_rolls_the_whole_page_back(pool: PgPool) {
+        sqlx::query(
+            "ALTER TABLE pothos.sync_cursor ADD CONSTRAINT no_cursor CHECK (last_user_id IS NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let a = Uuid::new_v4();
+        let page = [MirrorRow {
+            user_id: a,
+            interests: vec!["jazz".into()],
+            personality_traits: vec![],
+            deal_breakers: vec![],
+            age_min: None,
+            age_max: None,
+            engine_updated_at: Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap(),
+        }];
+
+        assert!(mirror::apply_page(&pool, &page).await.is_err());
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM pothos.insight_mirror")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "upserts rolled back with the failed cursor update");
+        assert!(mirror::load_cursor(&pool).await.unwrap().is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_next_that_does_not_advance_ends_the_walk(pool: PgPool) {
+        let server = MockServer::start().await;
+        let a = Uuid::new_v4();
+        // `next` equals the position this request was made from: a conforming
+        // engine never does this, and following it would loop forever.
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "profiles": [row(a, "2026-10-13T12:00:00Z", &["jazz"])],
+                "next": { "updated_at": "1970-01-01T00:00:00Z", "user_id": Uuid::nil() }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let n = tokio::time::timeout(Duration::from_secs(10), run_once(&pool, &client(&server)))
+            .await
+            .expect("walk must terminate")
+            .unwrap();
+        assert_eq!(n, 1);
+        assert!(mirror::load(&pool, a).await.unwrap().is_some());
     }
 }
