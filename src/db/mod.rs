@@ -5,6 +5,8 @@
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
+pub mod candidates;
+pub mod mirror;
 pub mod profiles;
 
 pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {
