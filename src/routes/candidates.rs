@@ -15,6 +15,10 @@ use crate::state::AppState;
 const DEFAULT_LIMIT: i64 = 20;
 const MAX_LIMIT: i64 = 100;
 
+fn effective_limit(requested: Option<i64>) -> usize {
+    requested.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT) as usize
+}
+
 #[derive(Deserialize, IntoParams)]
 pub struct CandidatesQuery {
     /// Default 20, clamped to 1..=100.
@@ -58,7 +62,7 @@ async fn get_candidates(
     Path(user_id): Path<Uuid>,
     Query(q): Query<CandidatesQuery>,
 ) -> Result<Json<CandidatesResponse>, AppError> {
-    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT) as usize;
+    let limit = effective_limit(q.limit);
 
     let me_profile = profiles::load(&state.pool, user_id)
         .await?
@@ -154,14 +158,14 @@ mod tests {
         )
     }
 
-    async fn profile_with(
+    async fn profile_as(
         pool: &PgPool,
+        id: Uuid,
         gender: &str,
         seeking: &[&str],
         city: Option<&str>,
         active: bool,
-    ) -> Uuid {
-        let id = Uuid::new_v4();
+    ) {
         profiles::upsert(
             pool,
             id,
@@ -177,6 +181,17 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    async fn profile_with(
+        pool: &PgPool,
+        gender: &str,
+        seeking: &[&str],
+        city: Option<&str>,
+        active: bool,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        profile_as(pool, id, gender, seeking, city, active).await;
         id
     }
 
@@ -240,16 +255,29 @@ mod tests {
         mirror(&pool, best, &["Jazz", "hiking"], &["calm"]).await;
         let meh = profile(&pool, "m", &["f"], None).await;
         mirror(&pool, meh, &["chess"], &["loud"]).await;
+        // Two candidates with identical inputs, hence identical scores, between
+        // `best` and `meh`; only the id tie-break orders them.
+        let mut tied = Vec::new();
+        for _ in 0..2 {
+            let id = profile(&pool, "m", &["f"], None).await;
+            mirror(&pool, id, &["tea"], &["calm"]).await;
+            tied.push(id);
+        }
+        tied.sort();
         let _wrong_gender = profile(&pool, "f", &["m"], Some("Singapore")).await;
 
         let (status, body) = get(pool, &format!("/v1/match/candidates/{me}")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["reason"].is_null());
         let c = body["candidates"].as_array().unwrap();
-        assert_eq!(c.len(), 2);
+        assert_eq!(c.len(), 4);
         assert_eq!(c[0]["user_id"], best.to_string());
-        assert_eq!(c[1]["user_id"], meh.to_string());
+        assert_eq!(c[1]["user_id"], tied[0].to_string(), "tie: lower id first");
+        assert_eq!(c[2]["user_id"], tied[1].to_string(), "tie: lower id first");
+        assert_eq!(c[3]["user_id"], meh.to_string());
+        assert_eq!(c[1]["score"], c[2]["score"]);
         assert!(c[0]["score"].as_f64().unwrap() > c[1]["score"].as_f64().unwrap());
+        assert!(c[2]["score"].as_f64().unwrap() > c[3]["score"].as_f64().unwrap());
         assert_eq!(
             c[0]["shared_interests"],
             serde_json::json!(["hiking", "jazz"])
@@ -257,8 +285,8 @@ mod tests {
         assert_eq!(c[0]["shared_traits"], serde_json::json!(["calm"]));
         assert_eq!(c[0]["geo_match"], "city");
         assert_eq!(c[0]["scores"]["interests"], 1.0);
-        assert_eq!(c[1]["geo_match"], "country");
-        assert_eq!(c[1]["scores"]["interests"], 0.0);
+        assert_eq!(c[3]["geo_match"], "country");
+        assert_eq!(c[3]["scores"]["interests"], 0.0);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -291,5 +319,54 @@ mod tests {
         assert_eq!(body["candidates"].as_array().unwrap().len(), 3);
         let (_, body) = get(pool, &format!("/v1/match/candidates/{me}?limit=2")).await;
         assert_eq!(body["candidates"].as_array().unwrap().len(), 2);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn limit_one_returns_the_best_candidate_not_the_lowest_id(pool: PgPool) {
+        let me = profile(&pool, "f", &["m"], Some("Singapore")).await;
+        mirror(&pool, me, &["jazz", "hiking"], &["calm"]).await;
+        // SQL returns candidates by id ascending, so the best one must sit
+        // on the higher id for the test to see ranking rather than SQL order.
+        let mut ids = [Uuid::new_v4(), Uuid::new_v4()];
+        ids.sort();
+        let [low, high] = ids;
+        profile_as(&pool, high, "m", &["f"], Some("Singapore"), true).await;
+        mirror(&pool, high, &["jazz", "hiking"], &["calm"]).await;
+        profile_as(&pool, low, "m", &["f"], None, true).await;
+        mirror(&pool, low, &["chess"], &["loud"]).await;
+
+        let (status, body) = get(pool, &format!("/v1/match/candidates/{me}?limit=1")).await;
+        assert_eq!(status, StatusCode::OK);
+        let c = body["candidates"].as_array().unwrap();
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0]["user_id"], high.to_string());
+    }
+
+    #[test]
+    fn effective_limit_defaults_to_20_and_clamps_to_1_100() {
+        use super::effective_limit;
+        assert_eq!(effective_limit(None), 20);
+        assert_eq!(effective_limit(Some(0)), 1);
+        assert_eq!(effective_limit(Some(-1)), 1);
+        assert_eq!(effective_limit(Some(100)), 100);
+        assert_eq!(effective_limit(Some(101)), 100);
+        assert_eq!(effective_limit(Some(7)), 7);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn missing_caller_secret_is_403_forbidden(pool: PgPool) {
+        let me = profile(&pool, "f", &["m"], None).await;
+        let res = build_app(test_state(pool))
+            .oneshot(
+                Request::get(format!("/v1/match/candidates/{me}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "forbidden");
     }
 }
