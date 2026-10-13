@@ -27,7 +27,11 @@ cargo run -- serve
 
 `migrate` must run on a direct connection, not through a transaction pooler — it sets `search_path` as a startup parameter so the migrator's bookkeeping table lands in the `pothos` schema.
 
+`serve` must connect as the role that owns the `pothos` tables (the one that ran `migrate`): row-level security is enabled with no policies, so any other role sees no rows.
+
 Without both `ENGINE_BASE_URL` and `ENGINE_EXPORT_SECRET` the sweeper stays off; setting only one refuses boot. The service then ranks whatever is already mirrored.
+
+The sweeper needs an eros-engine build that serves `GET /svc/v1/insights/changes` ([eros-engine PR #406](https://github.com/etherfunlab/eros-engine/pull/406)), with `INSIGHTS_EXPORT_SECRET` set on the engine (at least 32 bytes) to the same value as `ENGINE_EXPORT_SECRET` here.
 
 ## API
 
@@ -47,9 +51,11 @@ GET    /healthz                           public
   "country": "SG", "region": null, "city": "Singapore", "active": true }
 ```
 
-`seeking_genders` is already expanded by the caller — this service never maps an orientation label to genders; that is a cultural and product decision, not an engine's. `gender` and `seeking_genders` are case-insensitive labels, stored lowercase.
+`seeking_genders` is already expanded by the caller — this service never maps an orientation label to genders; that is a cultural and product decision, not an engine's. `gender` and `seeking_genders` are case-insensitive labels, stored lowercase. PUT replaces every field: an omitted optional field becomes null and an omitted `active` resets to `true`. Unknown keys are rejected (400).
 
 `active: false` keeps the row but takes the user out of the pool: they drop out of everyone's candidates and get `404 not_in_pool` from `/v1/match/candidates`. `DELETE` of a non-member is also `404 not_in_pool`.
+
+**Data lifecycle.** `DELETE /v1/profiles/{user_id}` removes only the hard attributes. The user's `pothos.insight_mirror` row stays until the engine next exports that user, and the export carries no deletions — to erase a user completely, also `DELETE FROM pothos.insight_mirror WHERE user_id = …`. If the engine still holds that user's insights, its next export of them recreates the row.
 
 `GET /v1/match/candidates/{user_id}` response:
 
@@ -58,7 +64,7 @@ GET    /healthz                           public
   "user_id": "…",
   "reason": null,
   "candidates": [
-    { "user_id": "…", "score": 0.73,
+    { "user_id": "…", "score": 0.85,
       "scores": { "interests": 1.0, "personality_traits": 0.5, "geo": 1.0 },
       "shared_interests": ["hiking", "jazz"], "shared_traits": ["calm"], "geo_match": "city" }
   ]

@@ -1,9 +1,20 @@
 //! One error type for every handler. Renders `{ "error": code, "message": text }`.
 
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde_json::json;
+use serde::Serialize;
+use utoipa::ToSchema;
+
+/// The body of every error response.
+#[derive(Serialize, ToSchema)]
+pub struct ErrorBody {
+    /// Machine-readable code: `bad_request`, `forbidden`, `not_in_pool` or `internal`.
+    pub error: String,
+    /// Human-readable detail.
+    pub message: String,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -16,6 +27,20 @@ pub enum AppError {
     #[error("database error")]
     Sqlx(#[from] sqlx::Error),
 }
+
+/// Extractor rejections would otherwise render as plain text with axum's own
+/// status codes (415 / 422); they all become the JSON `bad_request` envelope.
+macro_rules! bad_request_from_rejection {
+    ($($rejection:ty),+) => {$(
+        impl From<$rejection> for AppError {
+            fn from(rej: $rejection) -> Self {
+                AppError::BadRequest(rej.body_text())
+            }
+        }
+    )+};
+}
+
+bad_request_from_rejection!(JsonRejection, PathRejection, QueryRejection);
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
@@ -30,7 +55,10 @@ impl IntoResponse for AppError {
         };
         (
             status,
-            Json(json!({ "error": code, "message": self.to_string() })),
+            Json(ErrorBody {
+                error: code.into(),
+                message: self.to_string(),
+            }),
         )
             .into_response()
     }

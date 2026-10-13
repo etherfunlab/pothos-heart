@@ -18,7 +18,9 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() {
     let _ = dotenvy::dotenv();
+    // Logs go to stderr so `print-openapi` keeps stdout clean.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )

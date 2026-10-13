@@ -79,11 +79,18 @@ fn same(a: Option<&str>, b: Option<&str>) -> bool {
 }
 
 /// Finest matching level; `None` unless the country matches on both sides.
+/// A city name only counts as a city match when it is not contradicted by the
+/// regions: equal regions, or at least one side without a region. Two
+/// "Springfield"s in different regions fall through to `Region` / `Country`.
 pub fn geo_match(a: &Geo, b: &Geo) -> Option<GeoMatch> {
     if !same(a.country, b.country) {
         return None;
     }
-    if same(a.city, b.city) {
+    let regions_differ = matches!(
+        (a.region.and_then(canon), b.region.and_then(canon)),
+        (Some(x), Some(y)) if x != y
+    );
+    if same(a.city, b.city) && !regions_differ {
         Some(GeoMatch::City)
     } else if same(a.region, b.region) {
         Some(GeoMatch::Region)
@@ -216,6 +223,34 @@ mod tests {
             geo_match(&no_country, &sg_city),
             None,
             "no country ⇒ no credit"
+        );
+    }
+
+    #[test]
+    fn a_city_match_is_not_credited_across_conflicting_regions() {
+        let springfield = |region| Geo {
+            country: Some("US"),
+            region,
+            city: Some("Springfield"),
+        };
+        assert_eq!(
+            geo_match(&springfield(Some("IL")), &springfield(Some("MO"))),
+            Some(GeoMatch::Country),
+            "same city name, different regions"
+        );
+        assert_eq!(
+            geo_match(&springfield(Some("IL")), &springfield(None)),
+            Some(GeoMatch::City),
+            "an unknown region does not veto the city"
+        );
+        assert_eq!(
+            geo_match(&springfield(None), &springfield(Some("MO"))),
+            Some(GeoMatch::City)
+        );
+        assert_eq!(
+            geo_match(&springfield(Some("il")), &springfield(Some(" IL "))),
+            Some(GeoMatch::City),
+            "regions compare in canonical form"
         );
     }
 

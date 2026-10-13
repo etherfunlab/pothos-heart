@@ -6,7 +6,8 @@ interests = 0.5
 personality_traits = 0.3
 geo = 0.2
 
-# Credit for the finest matching geo level. Country must match for any credit.
+# Credit for the finest matching geo level, each between 0 and 1. Country must
+# match for any credit; a city counts only when the regions don't contradict it.
 [geo]
 city = 1.0
 region = 0.6

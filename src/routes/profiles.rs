@@ -1,6 +1,7 @@
 //! Hard attributes, pushed by the product layer. The row's existence with
 //! `active = true` is the pool membership.
 
+use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
@@ -11,7 +12,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::db::profiles::{self, ProfileWrite};
-use crate::error::AppError;
+use crate::error::{AppError, ErrorBody};
 use crate::state::AppState;
 
 fn default_true() -> bool {
@@ -20,8 +21,10 @@ fn default_true() -> bool {
 
 /// Hard attributes for one user. `seeking_genders` is already expanded by the
 /// product layer ("who I am looking for"); this service never maps an
-/// orientation label to genders.
+/// orientation label to genders. Unknown keys are rejected: a mistyped optional
+/// key must not silently store NULL.
 #[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProfileBody {
     /// A free-form label, matched case-insensitively: trimmed and stored lowercase.
     pub gender: String,
@@ -85,16 +88,18 @@ fn validate(b: ProfileBody) -> Result<ProfileWrite, AppError> {
     request_body = ProfileBody,
     responses(
         (status = 204, description = "stored"),
-        (status = 400, description = "bad_request"),
-        (status = 403, description = "forbidden")
+        (status = 400, description = "bad_request", body = ErrorBody),
+        (status = 403, description = "forbidden", body = ErrorBody)
     ),
     security(("caller_secret" = []))
 )]
 async fn put_profile(
     State(state): State<AppState>,
-    Path(user_id): Path<Uuid>,
-    Json(body): Json<ProfileBody>,
+    user_id: Result<Path<Uuid>, PathRejection>,
+    body: Result<Json<ProfileBody>, JsonRejection>,
 ) -> Result<StatusCode, AppError> {
+    let Path(user_id) = user_id?;
+    let Json(body) = body?;
     let w = validate(body)?;
     profiles::upsert(&state.pool, user_id, &w).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -108,15 +113,17 @@ async fn put_profile(
     params(("user_id" = Uuid, Path)),
     responses(
         (status = 204, description = "removed"),
-        (status = 404, description = "not_in_pool"),
-        (status = 403, description = "forbidden")
+        (status = 400, description = "bad_request", body = ErrorBody),
+        (status = 403, description = "forbidden", body = ErrorBody),
+        (status = 404, description = "not_in_pool", body = ErrorBody)
     ),
     security(("caller_secret" = []))
 )]
 async fn delete_profile(
     State(state): State<AppState>,
-    Path(user_id): Path<Uuid>,
+    user_id: Result<Path<Uuid>, PathRejection>,
 ) -> Result<StatusCode, AppError> {
+    let Path(user_id) = user_id?;
     if profiles::delete(&state.pool, user_id).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -139,28 +146,42 @@ mod tests {
     use crate::routes::build_app;
     use crate::state::{test_state, TEST_SECRET};
 
+    async fn send_raw(
+        pool: sqlx::PgPool,
+        method: &str,
+        uri: &str,
+        content_type: Option<&str>,
+        body: String,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(CALLER_SECRET_HEADER, TEST_SECRET);
+        if let Some(ct) = content_type {
+            req = req.header(header::CONTENT_TYPE, ct);
+        }
+        let res = build_app(test_state(pool))
+            .oneshot(req.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = to_bytes(res.into_body(), 1 << 16).await.unwrap();
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).expect("every response body is JSON")
+        };
+        (status, json)
+    }
+
     async fn send(
         pool: sqlx::PgPool,
         method: &str,
         uri: &str,
         body: Option<serde_json::Value>,
     ) -> (StatusCode, serde_json::Value) {
-        let req = Request::builder()
-            .method(method)
-            .uri(uri)
-            .header(CALLER_SECRET_HEADER, TEST_SECRET)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
-            .unwrap();
-        let res = build_app(test_state(pool)).oneshot(req).await.unwrap();
-        let status = res.status();
-        let bytes = to_bytes(res.into_body(), 1 << 16).await.unwrap();
-        let json = if bytes.is_empty() {
-            serde_json::Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap()
-        };
-        (status, json)
+        let body = body.map(|b| b.to_string()).unwrap_or_default();
+        send_raw(pool, method, uri, Some("application/json"), body).await
     }
 
     fn valid() -> serde_json::Value {
@@ -264,6 +285,67 @@ mod tests {
             send(pool.clone(), "PUT", &format!("/v1/profiles/{id}"), Some(b)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["message"].as_str().unwrap().contains("birth_date"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn put_rejects_an_unknown_key_instead_of_storing_null(pool: sqlx::PgPool) {
+        let id = Uuid::new_v4();
+        let mut b = valid();
+        b.as_object_mut().unwrap().remove("birth_date");
+        b["birthdate"] = serde_json::json!("1996-04-02");
+        let (status, body) =
+            send(pool.clone(), "PUT", &format!("/v1/profiles/{id}"), Some(b)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "bad_request");
+        assert!(body["message"].as_str().unwrap().contains("birthdate"));
+        assert!(crate::db::profiles::load(&pool, id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn extractor_rejections_use_the_json_error_envelope(pool: sqlx::PgPool) {
+        let id = Uuid::new_v4();
+        let json = Some("application/json");
+        let cases: [(&str, &str, Option<&str>, String); 6] = [
+            ("PUT", "/v1/profiles/not-a-uuid", json, valid().to_string()),
+            ("DELETE", "/v1/profiles/not-a-uuid", None, String::new()),
+            (
+                "PUT",
+                &format!("/v1/profiles/{id}"),
+                json,
+                "{not json".into(),
+            ),
+            // Valid JSON of the wrong shape is 422 in axum; here it is 400.
+            (
+                "PUT",
+                &format!("/v1/profiles/{id}"),
+                json,
+                r#"{"gender":"f"}"#.into(),
+            ),
+            (
+                "PUT",
+                &format!("/v1/profiles/{id}"),
+                None,
+                valid().to_string(),
+            ),
+            (
+                "PUT",
+                &format!("/v1/profiles/{id}"),
+                Some("text/plain"),
+                valid().to_string(),
+            ),
+        ];
+        for (method, uri, content_type, body) in cases {
+            let (status, json) = send_raw(pool.clone(), method, uri, content_type, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}");
+            assert_eq!(json["error"], "bad_request", "{method} {uri}");
+            assert!(
+                !json["message"].as_str().unwrap().is_empty(),
+                "{method} {uri}"
+            );
+        }
     }
 
     #[sqlx::test(migrations = "./migrations")]

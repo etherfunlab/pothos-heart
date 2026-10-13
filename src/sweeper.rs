@@ -35,13 +35,19 @@ fn canonical(values: &[String]) -> Vec<String> {
 
 impl From<&ExportRow> for MirrorRow {
     fn from(r: &ExportRow) -> Self {
+        // An inverted window (min > max) can match nobody, so it is dropped
+        // rather than mirrored: "no usable age preference" excludes no one.
+        let (age_min, age_max) = match (r.age_min, r.age_max) {
+            (Some(min), Some(max)) if min > max => (None, None),
+            window => window,
+        };
         Self {
             user_id: r.user_id,
             interests: canonical(&r.interests),
             personality_traits: canonical(&r.personality_traits),
             deal_breakers: canonical(&r.deal_breakers),
-            age_min: r.age_min,
-            age_max: r.age_max,
+            age_min,
+            age_max,
             engine_updated_at: r.updated_at,
         }
     }
@@ -88,8 +94,10 @@ pub async fn run_loop(pool: PgPool, client: EngineClient, interval: Duration) {
         match run_once(&pool, &client).await {
             Ok(n) if n > 0 => tracing::info!(rows = n, "mirror sweep"),
             Ok(_) => tracing::debug!("mirror sweep: nothing new"),
+            // Debug, not Display: it carries the cause chain, so the operator
+            // can tell a refused connection from DNS or TLS.
             Err(e) => {
-                tracing::warn!(error = %e, "mirror sweep failed; cursor kept at last landed page")
+                tracing::warn!(error = ?e, "mirror sweep failed; cursor kept at last landed page")
             }
         }
         tokio::time::sleep(interval).await;
@@ -298,6 +306,33 @@ mod tests {
         assert_eq!(m.interests, vec!["jazz", "hiking"]);
         assert_eq!(m.personality_traits, vec!["calm"]);
         assert_eq!(m.deal_breakers, vec!["smoking"]);
+    }
+
+    fn export_row(age_min: Option<i32>, age_max: Option<i32>) -> ExportRow {
+        ExportRow {
+            user_id: Uuid::new_v4(),
+            interests: vec![],
+            personality_traits: vec![],
+            deal_breakers: vec![],
+            age_min,
+            age_max,
+            updated_at: Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn an_inverted_age_window_is_mirrored_as_no_preference() {
+        for ((min, max), want) in [
+            ((Some(30), Some(25)), (None, None)),
+            ((Some(25), Some(30)), (Some(25), Some(30))),
+            ((Some(30), Some(30)), (Some(30), Some(30))),
+            ((Some(30), None), (Some(30), None)),
+            ((None, Some(25)), (None, Some(25))),
+            ((None, None), (None, None)),
+        ] {
+            let m = MirrorRow::from(&export_row(min, max));
+            assert_eq!((m.age_min, m.age_max), want, "export ({min:?}, {max:?})");
+        }
     }
 
     #[sqlx::test(migrations = "./migrations")]

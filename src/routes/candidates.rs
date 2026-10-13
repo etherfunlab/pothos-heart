@@ -1,5 +1,6 @@
 //! The match: hard filter in SQL, soft score in Rust, nothing persisted.
 
+use axum::extract::rejection::{PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -8,7 +9,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::db::{candidates, mirror, profiles};
-use crate::error::AppError;
+use crate::error::{AppError, ErrorBody};
 use crate::scoring::{self, Geo, Scored, Side};
 use crate::state::AppState;
 
@@ -52,16 +53,19 @@ pub struct CandidatesResponse {
     params(("user_id" = Uuid, Path), CandidatesQuery),
     responses(
         (status = 200, body = CandidatesResponse),
-        (status = 404, description = "not_in_pool"),
-        (status = 403, description = "forbidden")
+        (status = 400, description = "bad_request", body = ErrorBody),
+        (status = 403, description = "forbidden", body = ErrorBody),
+        (status = 404, description = "not_in_pool", body = ErrorBody)
     ),
     security(("caller_secret" = []))
 )]
 async fn get_candidates(
     State(state): State<AppState>,
-    Path(user_id): Path<Uuid>,
-    Query(q): Query<CandidatesQuery>,
+    user_id: Result<Path<Uuid>, PathRejection>,
+    q: Result<Query<CandidatesQuery>, QueryRejection>,
 ) -> Result<Json<CandidatesResponse>, AppError> {
+    let Path(user_id) = user_id?;
+    let Query(q) = q?;
     let limit = effective_limit(q.limit);
 
     let me_profile = profiles::load(&state.pool, user_id)
@@ -221,6 +225,20 @@ mod tests {
         let (status, body) = get(pool, &format!("/v1/match/candidates/{}", Uuid::new_v4())).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "not_in_pool");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn bad_path_or_query_is_400_bad_request_json(pool: PgPool) {
+        let me = profile(&pool, "f", &["m"], None).await;
+        for uri in [
+            "/v1/match/candidates/not-a-uuid".to_string(),
+            format!("/v1/match/candidates/{me}?limit=abc"),
+        ] {
+            let (status, body) = get(pool.clone(), &uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(body["error"], "bad_request", "{uri}");
+            assert!(!body["message"].as_str().unwrap().is_empty(), "{uri}");
+        }
     }
 
     #[sqlx::test(migrations = "./migrations")]

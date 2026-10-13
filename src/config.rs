@@ -177,16 +177,27 @@ impl Weights {
             geo: f.weights.geo,
             geo_levels: f.geo,
         };
+        let geo_levels = [
+            ("geo.city", w.geo_levels.city),
+            ("geo.region", w.geo_levels.region),
+            ("geo.country", w.geo_levels.country),
+        ];
         for (name, v) in [
             ("weights.interests", w.interests),
             ("weights.personality_traits", w.personality_traits),
             ("weights.geo", w.geo),
-            ("geo.city", w.geo_levels.city),
-            ("geo.region", w.geo_levels.region),
-            ("geo.country", w.geo_levels.country),
-        ] {
+        ]
+        .into_iter()
+        .chain(geo_levels)
+        {
             if !v.is_finite() || v < 0.0 {
                 return Err(format!("{name} must be a non-negative number, got {v}"));
+            }
+        }
+        // A level above 1.0 pushes the score past 1.0, breaking the [0, 1] contract.
+        for (name, v) in geo_levels {
+            if v > 1.0 {
+                return Err(format!("{name} must be at most 1.0, got {v}"));
             }
         }
         if w.interests + w.personality_traits + w.geo <= 0.0 {
@@ -300,5 +311,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("sum"));
+    }
+
+    #[test]
+    fn geo_levels_above_one_are_rejected_by_name() {
+        for key in ["city", "region", "country"] {
+            let mut levels = [("city", "1.0"), ("region", "0.6"), ("country", "0.3")];
+            levels.iter_mut().find(|(k, _)| *k == key).unwrap().1 = "1.5";
+            let geo: String = levels.iter().map(|(k, v)| format!("{k} = {v}\n")).collect();
+            let err = Weights::parse(&format!(
+                "[weights]\ninterests = 0.5\npersonality_traits = 0.3\ngeo = 0.2\n[geo]\n{geo}"
+            ))
+            .unwrap_err();
+            assert!(err.contains(&format!("geo.{key}")), "{err}");
+        }
+        // Exactly 1.0 is the ceiling, not over it.
+        assert!(Weights::parse(
+            "[weights]\ninterests = 0.5\npersonality_traits = 0.3\ngeo = 0.2\n\
+             [geo]\ncity = 1.0\nregion = 1.0\ncountry = 1.0\n"
+        )
+        .is_ok());
     }
 }
