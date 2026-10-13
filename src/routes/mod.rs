@@ -10,8 +10,14 @@ use crate::state::AppState;
 
 pub mod health;
 
+/// Every `/v1` route is merged here, before the caller-secret layer is applied
+/// in `router()` — a route added after `.layer` would bypass auth.
+fn v1_routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+}
+
 pub fn router(state: AppState) -> OpenApiRouter<AppState> {
-    let v1 = OpenApiRouter::new().layer(from_fn_with_state(state, require_caller_secret));
+    let v1 = v1_routes().layer(from_fn_with_state(state, require_caller_secret));
     OpenApiRouter::new().merge(health::router()).merge(v1)
 }
 
@@ -19,7 +25,9 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
 // wired by print-openapi in Task 11
 #[allow(dead_code)]
 pub fn router_for_openapi() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new().merge(health::router())
+    OpenApiRouter::new()
+        .merge(health::router())
+        .merge(v1_routes())
 }
 
 pub fn build_app(state: AppState) -> Router {

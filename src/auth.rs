@@ -61,7 +61,7 @@ mod tests {
             serde_json::from_slice(&to_bytes(res.into_body(), 4096).await.unwrap()).unwrap();
         assert_eq!(body["error"], "forbidden");
 
-        let res = probe(test_state(pool))
+        let res = probe(test_state(pool.clone()))
             .oneshot(
                 Request::get("/probe")
                     .header(CALLER_SECRET_HEADER, "wrong")
@@ -71,6 +71,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Same length as the real secret, last byte differs: gets past the
+        // length check, so only the byte comparison can reject it.
+        let mut same_len = TEST_SECRET.to_string();
+        same_len.pop();
+        same_len.push('0');
+        assert_eq!(same_len.len(), TEST_SECRET.len());
+        assert_ne!(same_len, TEST_SECRET);
+        let res = probe(test_state(pool))
+            .oneshot(
+                Request::get("/probe")
+                    .header(CALLER_SECRET_HEADER, same_len)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "forbidden");
     }
 
     #[sqlx::test(migrations = "./migrations")]

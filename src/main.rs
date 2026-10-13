@@ -48,14 +48,15 @@ async fn run_serve() -> Result<(), Box<dyn std::error::Error>> {
     let config = config::Config::from_env()?;
     let weights = config::Weights::load(&config.weights_path)?;
     let pool = db::connect(&config.database_url).await?;
+    let bind_addr = config.bind_addr.clone();
     let state = state::AppState {
         pool,
-        config: Arc::new(config.clone()),
+        config: Arc::new(config),
         weights: Arc::new(weights),
     };
     let app = routes::build_app(state);
-    let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
-    tracing::info!(addr = %config.bind_addr, "pothos-heart listening");
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    tracing::info!(addr = %bind_addr, "pothos-heart listening");
     axum::serve(listener, app).await?;
     Ok(())
 }
