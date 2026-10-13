@@ -5,12 +5,12 @@
 mod auth;
 mod config;
 mod db;
-#[allow(dead_code)] // consumed by Task 10
 mod engine_client;
 mod error;
 mod routes;
 mod scoring;
 mod state;
+mod sweeper;
 
 use std::sync::Arc;
 
@@ -57,6 +57,14 @@ async fn run_serve() -> Result<(), Box<dyn std::error::Error>> {
         config: Arc::new(config),
         weights: Arc::new(weights),
     };
+    match (&state.config.engine, state.config.sweep_interval) {
+        (Some(engine), interval) if interval > std::time::Duration::ZERO => {
+            let client = engine_client::EngineClient::new(engine);
+            tokio::spawn(sweeper::run_loop(state.pool.clone(), client, interval));
+            tracing::info!(every_secs = interval.as_secs(), engine = %engine.base_url, "mirror sweeper on");
+        }
+        _ => tracing::info!("mirror sweeper off (no ENGINE_* config or SWEEP_DISABLED)"),
+    }
     let app = routes::build_app(state);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!(addr = %bind_addr, "pothos-heart listening");

@@ -6,6 +6,8 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::engine_client::Cursor;
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct MirrorRow {
     pub user_id: Uuid,
@@ -27,9 +29,8 @@ pub async fn load(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Option<MirrorRow
     .await
 }
 
-// consumed by Task 10
-#[allow(dead_code)]
-pub async fn upsert_one(pool: &PgPool, row: &MirrorRow) -> sqlx::Result<()> {
+/// The one upsert statement; `upsert_one` and `apply_page` both run it.
+async fn upsert_row<'e>(exec: impl sqlx::PgExecutor<'e>, row: &MirrorRow) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO pothos.insight_mirror \
             (user_id, interests, personality_traits, deal_breakers, age_min, age_max, engine_updated_at, synced_at) \
@@ -46,7 +47,48 @@ pub async fn upsert_one(pool: &PgPool, row: &MirrorRow) -> sqlx::Result<()> {
     .bind(row.age_min)
     .bind(row.age_max)
     .bind(row.engine_updated_at)
-    .execute(pool)
+    .execute(exec)
     .await?;
     Ok(())
+}
+
+/// Single-row form of the upsert, for test fixtures.
+#[cfg(test)]
+pub async fn upsert_one(pool: &PgPool, row: &MirrorRow) -> sqlx::Result<()> {
+    upsert_row(pool, row).await
+}
+
+pub async fn load_cursor(pool: &PgPool) -> sqlx::Result<Option<Cursor>> {
+    let row: (Option<DateTime<Utc>>, Option<Uuid>) =
+        sqlx::query_as("SELECT last_updated_at, last_user_id FROM pothos.sync_cursor WHERE id = 1")
+            .fetch_one(pool)
+            .await?;
+    Ok(match row {
+        (Some(updated_at), Some(user_id)) => Some(Cursor {
+            updated_at,
+            user_id,
+        }),
+        _ => None,
+    })
+}
+
+/// Upsert every row and move the cursor to the last one, in one transaction.
+/// Rows must arrive in the engine's `(updated_at, user_id)` order — the last
+/// row is the cursor. An empty slice is a no-op.
+pub async fn apply_page(pool: &PgPool, rows: &[MirrorRow]) -> sqlx::Result<()> {
+    let Some(last) = rows.last() else {
+        return Ok(());
+    };
+    let mut tx = pool.begin().await?;
+    for r in rows {
+        upsert_row(&mut *tx, r).await?;
+    }
+    sqlx::query(
+        "UPDATE pothos.sync_cursor SET last_updated_at = $1, last_user_id = $2, synced_at = now() WHERE id = 1",
+    )
+    .bind(last.engine_updated_at)
+    .bind(last.user_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
 }
