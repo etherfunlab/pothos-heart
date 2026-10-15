@@ -3,10 +3,12 @@
 //! Subcommands: `serve` (default) · `migrate` · `print-openapi`.
 
 mod auth;
+mod concepts;
 mod config;
 mod db;
 mod engine_client;
 mod error;
+mod llm;
 mod openapi;
 mod routes;
 mod scoring;
@@ -68,6 +70,7 @@ async fn run_migrate() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_serve() -> Result<(), Box<dyn std::error::Error>> {
     let config = config::Config::from_env()?;
     let weights = config::Weights::load(&config.weights_path)?;
+    let label_language = config::load_label_language(&config.weights_path)?;
     let pool = db::connect(&config.database_url).await?;
     let bind_addr = config.bind_addr.clone();
     let state = state::AppState {
@@ -75,13 +78,26 @@ async fn run_serve() -> Result<(), Box<dyn std::error::Error>> {
         config: Arc::new(config),
         weights: Arc::new(weights),
     };
+    let concept_task = state.config.llm.as_ref().map(|llm| concepts::ConceptTask {
+        client: llm::LlmClient::new(llm),
+        label_language,
+        max_per_tick: state.config.concept_max_per_tick,
+    });
     match (&state.config.engine, state.config.sweep_interval) {
         (Some(engine), interval) if interval > std::time::Duration::ZERO => {
             let client = engine_client::EngineClient::new(engine);
-            tokio::spawn(sweeper::run_loop(state.pool.clone(), client, interval));
-            tracing::info!(every_secs = interval.as_secs(), engine = %engine.base_url, "mirror sweeper on");
+            let concepts_on = concept_task.is_some();
+            tokio::spawn(sweeper::run_loop(
+                state.pool.clone(),
+                client,
+                concept_task,
+                interval,
+            ));
+            tracing::info!(every_secs = interval.as_secs(), engine = %engine.base_url, concepts = concepts_on, "mirror sweeper on");
         }
-        _ => tracing::info!("mirror sweeper off (no ENGINE_* config or SWEEP_DISABLED)"),
+        _ => tracing::info!(
+            "mirror sweeper off (no ENGINE_* config or SWEEP_DISABLED); the concept step runs only with it"
+        ),
     }
     let app = routes::build_app(state);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;

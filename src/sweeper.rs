@@ -1,4 +1,4 @@
-//! Pulls the engine's insights export into `pothos.insight_mirror`. Each page
+//! Pulls the engine's insights export into the mirror and the phrase ledger. Each page
 //! is committed with its cursor in one transaction, so a failure mid-walk
 //! leaves the cursor at the last page that landed — never ahead of the data.
 
@@ -8,9 +8,9 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::concepts::ConceptTask;
 use crate::db::mirror::{self, MirrorRow};
 use crate::engine_client::{EngineClient, EngineError, ExportRow};
-use crate::scoring;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SweepError {
@@ -18,19 +18,6 @@ pub enum SweepError {
     Engine(#[from] EngineError),
     #[error(transparent)]
     Db(#[from] sqlx::Error),
-}
-
-/// Canonical labels (`scoring::canon`: trimmed, lowercase, non-empty), repeats
-/// dropped, first occurrence wins. The SQL hard filter compares these arrays
-/// with exact `&&`, so the mirror must hold the same form the scorer reads.
-fn canonical(values: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::with_capacity(values.len());
-    for c in values.iter().filter_map(|v| scoring::canon(v)) {
-        if !out.contains(&c) {
-            out.push(c);
-        }
-    }
-    out
 }
 
 impl From<&ExportRow> for MirrorRow {
@@ -41,11 +28,12 @@ impl From<&ExportRow> for MirrorRow {
             (Some(min), Some(max)) if min > max => (None, None),
             window => window,
         };
+        // Arrays are canonicalised when written (`mirror::upsert_row`).
         Self {
             user_id: r.user_id,
-            interests: canonical(&r.interests),
-            personality_traits: canonical(&r.personality_traits),
-            deal_breakers: canonical(&r.deal_breakers),
+            interests: r.interests.clone(),
+            personality_traits: r.personality_traits.clone(),
+            deal_breakers: r.deal_breakers.clone(),
             age_min,
             age_max,
             engine_updated_at: r.updated_at,
@@ -87,9 +75,15 @@ pub async fn run_once(pool: &PgPool, client: &EngineClient) -> Result<usize, Swe
     Ok(total)
 }
 
-/// Sweep forever at `interval`. Errors are logged; the next tick retries from
-/// wherever the cursor stopped.
-pub async fn run_loop(pool: PgPool, client: EngineClient, interval: Duration) {
+/// Sweep forever at `interval`: mirror the export, then — when a model is
+/// configured — decide undecided phrases, whatever the mirror step did.
+/// Errors are logged; the next tick retries from wherever each step stopped.
+pub async fn run_loop(
+    pool: PgPool,
+    client: EngineClient,
+    concepts: Option<ConceptTask>,
+    interval: Duration,
+) {
     loop {
         match run_once(&pool, &client).await {
             Ok(n) if n > 0 => tracing::info!(rows = n, "mirror sweep"),
@@ -98,6 +92,20 @@ pub async fn run_loop(pool: PgPool, client: EngineClient, interval: Duration) {
             // can tell a refused connection from DNS or TLS.
             Err(e) => {
                 tracing::warn!(error = ?e, "mirror sweep failed; cursor kept at last landed page")
+            }
+        }
+        if let Some(task) = &concepts {
+            match crate::concepts::run_once(&pool, task).await {
+                Ok(r) if r.decided + r.skipped > 0 => tracing::info!(
+                    decided = r.decided,
+                    skipped = r.skipped,
+                    new_concepts = r.new_concepts,
+                    vocabulary = r.vocabulary,
+                    tokens = r.tokens,
+                    "concept step"
+                ),
+                Ok(_) => tracing::debug!("concept step: nothing undecided"),
+                Err(e) => tracing::warn!(error = ?e, "concept step failed; phrases stay undecided"),
             }
         }
         tokio::time::sleep(interval).await;
@@ -166,11 +174,11 @@ mod tests {
         let n = run_once(&pool, &client(&server)).await.unwrap();
         assert_eq!(n, 3);
         assert_eq!(
-            mirror::load(&pool, a).await.unwrap().unwrap().interests,
+            mirror::current(&pool, a, "interests").await.unwrap(),
             vec!["jazz"]
         );
         assert_eq!(
-            mirror::load(&pool, c).await.unwrap().unwrap().interests,
+            mirror::current(&pool, c, "interests").await.unwrap(),
             vec!["chess"]
         );
         let cur = mirror::load_cursor(&pool).await.unwrap().unwrap();
@@ -270,11 +278,8 @@ mod tests {
             .await;
 
         assert!(run_once(&pool, &client(&server)).await.is_err());
-        assert!(
-            mirror::load(&pool, a).await.unwrap().is_some(),
-            "page one landed"
-        );
-        assert!(mirror::load(&pool, b).await.unwrap().is_none());
+        assert!(mirror::exists(&pool, a).await.unwrap(), "page one landed");
+        assert!(!mirror::exists(&pool, b).await.unwrap());
         assert_eq!(
             mirror::load_cursor(&pool).await.unwrap().unwrap().user_id,
             a,
@@ -283,7 +288,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn mirror_arrays_are_trimmed_lowercased_and_deduplicated(pool: PgPool) {
+    async fn mirror_phrases_are_trimmed_lowercased_and_deduplicated(pool: PgPool) {
         let server = MockServer::start().await;
         let a = Uuid::new_v4();
         Mock::given(method("GET"))
@@ -302,10 +307,20 @@ mod tests {
             .await;
 
         run_once(&pool, &client(&server)).await.unwrap();
-        let m = mirror::load(&pool, a).await.unwrap().unwrap();
-        assert_eq!(m.interests, vec!["jazz", "hiking"]);
-        assert_eq!(m.personality_traits, vec!["calm"]);
-        assert_eq!(m.deal_breakers, vec!["smoking"]);
+        assert_eq!(
+            mirror::current(&pool, a, "interests").await.unwrap(),
+            vec!["hiking", "jazz"]
+        );
+        assert_eq!(
+            mirror::current(&pool, a, "personality_traits")
+                .await
+                .unwrap(),
+            vec!["calm"]
+        );
+        assert_eq!(
+            mirror::current(&pool, a, "deal_breakers").await.unwrap(),
+            vec!["smoking"]
+        );
     }
 
     fn export_row(age_min: Option<i32>, age_max: Option<i32>) -> ExportRow {
@@ -360,6 +375,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 0, "upserts rolled back with the failed cursor update");
+        let phrases: i64 = sqlx::query_scalar("SELECT count(*) FROM pothos.observed_phrases")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(phrases, 0, "phrase upserts rolled back too");
         assert!(mirror::load_cursor(&pool).await.unwrap().is_none());
     }
 
@@ -383,6 +403,6 @@ mod tests {
             .expect("walk must terminate")
             .unwrap();
         assert_eq!(n, 1);
-        assert!(mirror::load(&pool, a).await.unwrap().is_some());
+        assert!(mirror::exists(&pool, a).await.unwrap());
     }
 }

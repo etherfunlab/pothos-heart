@@ -25,6 +25,8 @@ pub(crate) fn test_state(pool: PgPool) -> AppState {
             engine: None,
             sweep_interval: std::time::Duration::ZERO,
             weights_path: "pothos.toml".into(),
+            llm: None,
+            concept_max_per_tick: 200,
         }),
         weights: Arc::new(Weights::default()),
     }

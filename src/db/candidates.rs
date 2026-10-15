@@ -1,4 +1,7 @@
-//! The hard filter: one statement over the two mirrors (spec §4.1).
+//! The hard filter: one statement over the profiles, the mirror's scalars and
+//! the concepts derived from the phrase ledger (`pothos.user_concepts`).
+//! Deal-breakers compare current concepts only; the arrays handed to scoring
+//! hold every concept a person has ever had.
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -13,30 +16,65 @@ pub struct CandidateRow {
     pub personality_traits: Vec<String>,
 }
 
+/// One user's concepts for scoring, sorted: everything ever observed, current or not.
+#[derive(Debug, Clone, Default, sqlx::FromRow)]
+pub struct ConceptSets {
+    pub interests: Vec<String>,
+    pub personality_traits: Vec<String>,
+}
+
+pub async fn concept_sets(pool: &PgPool, user_id: Uuid) -> sqlx::Result<ConceptSets> {
+    sqlx::query_as(
+        "SELECT \
+            COALESCE(array_agg(DISTINCT concept ORDER BY concept) \
+                FILTER (WHERE dimension = 'interests'), '{}') AS interests, \
+            COALESCE(array_agg(DISTINCT concept ORDER BY concept) \
+                FILTER (WHERE dimension = 'personality_traits'), '{}') AS personality_traits \
+         FROM pothos.user_concepts WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+}
+
 /// Everyone in the pool who survives the hard filter against `me`. Missing
 /// data never excludes: an age rule only fires when the preference and the
-/// birth date both exist; a candidate without a mirror row is kept with empty
+/// birth date both exist; a candidate without concepts is kept with empty
 /// arrays. Geo is not a filter. Returns nothing if `me` has no profile row.
 pub async fn hard_filtered(pool: &PgPool, me: Uuid) -> sqlx::Result<Vec<CandidateRow>> {
     sqlx::query_as::<_, CandidateRow>(
-        "WITH me AS ( \
+        "WITH sets AS ( \
+            SELECT user_id, \
+                   COALESCE(array_agg(DISTINCT concept ORDER BY concept) \
+                       FILTER (WHERE dimension = 'interests'), '{}') AS interests, \
+                   COALESCE(array_agg(DISTINCT concept ORDER BY concept) \
+                       FILTER (WHERE dimension = 'personality_traits'), '{}') AS personality_traits, \
+                   COALESCE(array_agg(DISTINCT concept) \
+                       FILTER (WHERE dimension <> 'deal_breakers' AND is_current), '{}') AS current_likes, \
+                   COALESCE(array_agg(DISTINCT concept) \
+                       FILTER (WHERE dimension = 'deal_breakers' AND is_current), '{}') AS current_deal_breakers \
+            FROM pothos.user_concepts \
+            GROUP BY user_id \
+         ), me AS ( \
             SELECT p.user_id, p.gender, p.seeking_genders, p.birth_date, \
-                   COALESCE(m.interests, '{}')          AS interests, \
-                   COALESCE(m.personality_traits, '{}') AS personality_traits, \
-                   COALESCE(m.deal_breakers, '{}')      AS deal_breakers, \
+                   COALESCE(s.current_likes, '{}')         AS current_likes, \
+                   COALESCE(s.current_deal_breakers, '{}') AS current_deal_breakers, \
                    m.age_min, m.age_max \
             FROM pothos.match_profiles p \
             LEFT JOIN pothos.insight_mirror m USING (user_id) \
+            LEFT JOIN sets s USING (user_id) \
             WHERE p.user_id = $1 \
          ), pool AS ( \
             SELECT c.user_id, c.gender, c.seeking_genders, c.birth_date, \
                    c.country, c.region, c.city, \
-                   COALESCE(cm.interests, '{}')          AS interests, \
-                   COALESCE(cm.personality_traits, '{}') AS personality_traits, \
-                   COALESCE(cm.deal_breakers, '{}')      AS deal_breakers, \
+                   COALESCE(s.interests, '{}')             AS interests, \
+                   COALESCE(s.personality_traits, '{}')    AS personality_traits, \
+                   COALESCE(s.current_likes, '{}')         AS current_likes, \
+                   COALESCE(s.current_deal_breakers, '{}') AS current_deal_breakers, \
                    cm.age_min, cm.age_max \
             FROM pothos.match_profiles c \
             LEFT JOIN pothos.insight_mirror cm USING (user_id) \
+            LEFT JOIN sets s USING (user_id) \
             WHERE c.active \
          ) \
          SELECT c.user_id, c.country, c.region, c.city, c.interests, c.personality_traits \
@@ -52,10 +90,8 @@ pub async fn hard_filtered(pool: &PgPool, me: Uuid) -> sqlx::Result<Vec<Candidat
                 OR extract(year from age(current_date, me.birth_date)) >= c.age_min) \
            AND (c.age_max IS NULL OR me.birth_date IS NULL \
                 OR extract(year from age(current_date, me.birth_date)) <= c.age_max) \
-           AND NOT (me.deal_breakers && c.interests) \
-           AND NOT (me.deal_breakers && c.personality_traits) \
-           AND NOT (c.deal_breakers && me.interests) \
-           AND NOT (c.deal_breakers && me.personality_traits) \
+           AND NOT (me.current_deal_breakers && c.current_likes) \
+           AND NOT (c.current_deal_breakers && me.current_likes) \
          ORDER BY c.user_id",
     )
     .bind(me)
@@ -65,11 +101,12 @@ pub async fn hard_filtered(pool: &PgPool, me: Uuid) -> sqlx::Result<Vec<Candidat
 
 #[cfg(test)]
 mod tests {
-    use chrono::{Datelike, NaiveDate, Utc};
+    use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
     use sqlx::PgPool;
     use uuid::Uuid;
 
-    use super::hard_filtered;
+    use super::{concept_sets, hard_filtered};
+    use crate::db::concepts::{self, Decision};
     use crate::db::mirror::{self, MirrorRow};
     use crate::db::profiles::{self, ProfileWrite};
 
@@ -122,6 +159,39 @@ mod tests {
                 age_min: age.map(|a| a.0),
                 age_max: age.map(|a| a.1),
                 engine_updated_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    fn t0() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 15, 12, 0, 0).unwrap()
+    }
+
+    fn t1() -> DateTime<Utc> {
+        t0() + chrono::Duration::minutes(5)
+    }
+
+    /// One export of this user at `t`; a later call is the engine's next export.
+    async fn mirror_at(
+        pool: &PgPool,
+        id: Uuid,
+        t: DateTime<Utc>,
+        interests: &[&str],
+        traits: &[&str],
+        deal: &[&str],
+    ) {
+        mirror::upsert_one(
+            pool,
+            &MirrorRow {
+                user_id: id,
+                interests: interests.iter().map(|s| s.to_string()).collect(),
+                personality_traits: traits.iter().map(|s| s.to_string()).collect(),
+                deal_breakers: deal.iter().map(|s| s.to_string()).collect(),
+                age_min: None,
+                age_max: None,
+                engine_updated_at: t,
             },
         )
         .await
@@ -276,5 +346,115 @@ mod tests {
         assert_eq!(rows[0].country.as_deref(), Some("SG"));
         assert_eq!(rows[0].interests, vec!["jazz", "tea"]);
         assert_eq!(rows[0].personality_traits, vec!["calm"]);
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    async fn deal_breakers_only_see_what_is_current_on_both_sides(pool: PgPool) {
+        let me = profile(&pool, "f", &["m"], None, true).await;
+        mirror_at(&pool, me, t0(), &["jazz"], &[], &["smoking"]).await;
+
+        // Said "smoking" once; the engine has since rewritten it away.
+        let quit = profile(&pool, "m", &["f"], None, true).await;
+        mirror_at(&pool, quit, t0(), &[], &["smoking"], &[]).await;
+        mirror_at(&pool, quit, t1(), &[], &["quit smoking"], &[]).await;
+        // Says it now.
+        let smokes = profile(&pool, "m", &["f"], None, true).await;
+        mirror_at(&pool, smokes, t1(), &[], &["smoking"], &[]).await;
+        // Once rejected jazz, no longer does.
+        let used_to_reject_jazz = profile(&pool, "m", &["f"], None, true).await;
+        mirror_at(&pool, used_to_reject_jazz, t0(), &[], &[], &["jazz"]).await;
+        mirror_at(&pool, used_to_reject_jazz, t1(), &["tea"], &[], &[]).await;
+
+        let got = ids(&pool, me).await;
+        let mut expected = vec![quit, used_to_reject_jazz];
+        expected.sort();
+        assert_eq!(got, expected);
+        assert!(!got.contains(&smokes));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn scoring_sets_keep_history_and_drop_repeats(pool: PgPool) {
+        let me = profile(&pool, "f", &["m"], None, true).await;
+        mirror_at(&pool, me, t0(), &["jazz", "tea"], &["calm"], &[]).await;
+        mirror_at(&pool, me, t1(), &["jazz"], &["calm"], &[]).await;
+        let him = profile(&pool, "m", &["f"], None, true).await;
+        mirror_at(&pool, him, t0(), &["chess"], &[], &[]).await;
+        mirror_at(&pool, him, t1(), &["tea"], &[], &[]).await;
+
+        let mine = concept_sets(&pool, me).await.unwrap();
+        assert_eq!(mine.interests, vec!["jazz", "tea"]);
+        assert_eq!(mine.personality_traits, vec!["calm"]);
+        let rows = hard_filtered(&pool, me).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].interests, vec!["chess", "tea"]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn concept_sets_of_an_unexported_user_are_empty(pool: PgPool) {
+        let s = concept_sets(&pool, Uuid::new_v4()).await.unwrap();
+        assert!(s.interests.is_empty());
+        assert!(s.personality_traits.is_empty());
+    }
+    fn decision(dimension: &str, phrase: &str, concepts: &[&str]) -> Decision {
+        Decision {
+            dimension: dimension.into(),
+            phrase: phrase.into(),
+            concepts: concepts.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn deal_breakers_and_shared_interests_work_on_concepts(pool: PgPool) {
+        let me = profile(&pool, "f", &["m"], None, true).await;
+        mirror_at(
+            &pool,
+            me,
+            t0(),
+            &["listens to old jazz"],
+            &[],
+            &["can't stand smoking"],
+        )
+        .await;
+        let chain = profile(&pool, "m", &["f"], None, true).await;
+        mirror_at(&pool, chain, t0(), &[], &["chain smoker"], &[]).await;
+        let quit = profile(&pool, "m", &["f"], None, true).await;
+        mirror_at(
+            &pool,
+            quit,
+            t0(),
+            &["weekend jazz bars"],
+            &["quit smoking three years ago"],
+            &[],
+        )
+        .await;
+        concepts::record(
+            &pool,
+            "m",
+            &[
+                decision("interests", "listens to old jazz", &["jazz"]),
+                decision("interests", "weekend jazz bars", &["jazz", "bars"]),
+                decision("deal_breakers", "can't stand smoking", &["smoking"]),
+                decision("personality_traits", "chain smoker", &["smoking"]),
+                decision(
+                    "personality_traits",
+                    "quit smoking three years ago",
+                    &["quitting smoking"],
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let rows = hard_filtered(&pool, me).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.user_id).collect::<Vec<_>>(),
+            vec![quit]
+        );
+        assert!(!rows.iter().any(|r| r.user_id == chain));
+        assert_eq!(rows[0].interests, vec!["bars", "jazz"]);
+        assert_eq!(rows[0].personality_traits, vec!["quitting smoking"]);
+        assert_eq!(
+            concept_sets(&pool, me).await.unwrap().interests,
+            vec!["jazz"]
+        );
     }
 }

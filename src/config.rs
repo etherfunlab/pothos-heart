@@ -24,6 +24,24 @@ impl std::fmt::Debug for EngineConfig {
     }
 }
 
+/// An OpenAI-compatible chat-completions endpoint for the concept step.
+#[derive(Clone)]
+pub struct LlmConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
+impl std::fmt::Debug for LlmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"<redacted>")
+            .field("model", &self.model)
+            .finish()
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub database_url: String,
@@ -32,6 +50,8 @@ pub struct Config {
     pub engine: Option<EngineConfig>,
     pub sweep_interval: Duration,
     pub weights_path: PathBuf,
+    pub llm: Option<LlmConfig>,
+    pub concept_max_per_tick: i64,
 }
 
 impl std::fmt::Debug for Config {
@@ -45,6 +65,8 @@ impl std::fmt::Debug for Config {
             )
             .field("sweep_interval", &self.sweep_interval)
             .field("weights_path", &self.weights_path)
+            .field("llm", &self.llm)
+            .field("concept_max_per_tick", &self.concept_max_per_tick)
             .finish()
     }
 }
@@ -136,6 +158,36 @@ impl Config {
             Duration::from_secs(secs)
         };
 
+        let llm = match (
+            nonblank("LLM_BASE_URL"),
+            nonblank("LLM_API_KEY"),
+            nonblank("LLM_MODEL"),
+        ) {
+            (None, None, None) => None,
+            (Some(base_url), Some(api_key), Some(model)) => Some(LlmConfig {
+                base_url: base_url.trim_end_matches('/').to_string(),
+                api_key,
+                model,
+            }),
+            _ => {
+                return Err(
+                    "LLM_BASE_URL, LLM_API_KEY and LLM_MODEL are set together or not at all".into(),
+                )
+            }
+        };
+
+        let concept_max_per_tick = match nonblank("CONCEPT_MAX_PER_TICK") {
+            None => 200,
+            Some(s) => match s.parse::<i64>() {
+                Ok(n) if n >= 1 => n,
+                _ => {
+                    return Err(format!(
+                        "CONCEPT_MAX_PER_TICK must be a positive integer: {s}"
+                    ))
+                }
+            },
+        };
+
         Ok(Self {
             database_url,
             bind_addr: nonblank("BIND_ADDR").unwrap_or_else(|| "0.0.0.0:8090".into()),
@@ -145,6 +197,8 @@ impl Config {
             weights_path: nonblank("POTHOS_WEIGHTS")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| "pothos.toml".into()),
+            llm,
+            concept_max_per_tick,
         })
     }
 }
@@ -210,6 +264,47 @@ impl Weights {
     pub fn total(&self) -> f64 {
         self.interests + self.personality_traits + self.geo
     }
+}
+
+#[derive(Deserialize, Default)]
+struct ConceptsFile {
+    #[serde(default)]
+    concepts: ConceptsSection,
+}
+
+#[derive(Deserialize)]
+struct ConceptsSection {
+    #[serde(default = "default_label_language")]
+    label_language: String,
+}
+
+impl Default for ConceptsSection {
+    fn default() -> Self {
+        Self {
+            label_language: default_label_language(),
+        }
+    }
+}
+
+fn default_label_language() -> String {
+    "en".into()
+}
+
+/// `[concepts] label_language` from the weights file: the language new
+/// concept labels are written in. `en` when absent.
+pub fn label_language(toml_text: &str) -> Result<String, String> {
+    let f: ConceptsFile = toml::from_str(toml_text).map_err(|e| format!("pothos toml: {e}"))?;
+    let lang = f.concepts.label_language.trim().to_string();
+    if lang.is_empty() {
+        return Err("concepts.label_language must not be blank".into());
+    }
+    Ok(lang)
+}
+
+pub fn load_label_language(path: &Path) -> Result<String, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read weights file {}: {e}", path.display()))?;
+    label_language(&text)
 }
 
 #[cfg(test)]
@@ -331,5 +426,100 @@ mod tests {
              [geo]\ncity = 1.0\nregion = 1.0\ncountry = 1.0\n"
         )
         .is_ok());
+    }
+    #[test]
+    fn llm_config_debug_redacts_the_key() {
+        let c = LlmConfig {
+            base_url: "http://llm".into(),
+            api_key: "sk-very-secret".into(),
+            model: "m".into(),
+        };
+        let shown = format!("{c:?}");
+        assert!(!shown.contains("sk-very-secret"), "{shown}");
+        assert!(
+            shown.contains("http://llm") && shown.contains("\"m\""),
+            "{shown}"
+        );
+    }
+    #[test]
+    fn llm_vars_are_all_or_none_and_the_base_url_loses_its_trailing_slash() {
+        let base = [
+            ("DATABASE_URL", "postgres://x"),
+            ("POTHOS_CALLER_SECRET", SECRET),
+        ];
+        for partial in [
+            vec![("LLM_BASE_URL", "http://llm/v1")],
+            vec![("LLM_BASE_URL", "http://llm/v1"), ("LLM_API_KEY", "k")],
+            vec![("LLM_MODEL", "m")],
+        ] {
+            let mut all = base.to_vec();
+            all.extend(partial);
+            let err = Config::parse(env(&all)).unwrap_err();
+            assert!(
+                err.contains("LLM_BASE_URL, LLM_API_KEY and LLM_MODEL"),
+                "{err}"
+            );
+        }
+
+        assert!(Config::parse(env(&base)).unwrap().llm.is_none());
+
+        let mut all = base.to_vec();
+        all.extend([
+            ("LLM_BASE_URL", "http://llm/v1/"),
+            ("LLM_API_KEY", "k"),
+            ("LLM_MODEL", "m"),
+        ]);
+        let llm = Config::parse(env(&all)).unwrap().llm.unwrap();
+        assert_eq!(llm.base_url, "http://llm/v1");
+        assert_eq!((llm.api_key.as_str(), llm.model.as_str()), ("k", "m"));
+    }
+
+    #[test]
+    fn concept_max_per_tick_defaults_to_200_and_must_be_positive() {
+        let base = [
+            ("DATABASE_URL", "postgres://x"),
+            ("POTHOS_CALLER_SECRET", SECRET),
+        ];
+        assert_eq!(Config::parse(env(&base)).unwrap().concept_max_per_tick, 200);
+        for bad in ["0", "-3", "many"] {
+            let mut all = base.to_vec();
+            all.push(("CONCEPT_MAX_PER_TICK", bad));
+            let err = Config::parse(env(&all)).unwrap_err();
+            assert!(err.contains("CONCEPT_MAX_PER_TICK"), "{bad}: {err}");
+        }
+        let mut all = base.to_vec();
+        all.push(("CONCEPT_MAX_PER_TICK", "50"));
+        assert_eq!(Config::parse(env(&all)).unwrap().concept_max_per_tick, 50);
+    }
+
+    #[test]
+    fn the_llm_key_never_shows_in_config_debug() {
+        let c = Config::parse(env(&[
+            ("DATABASE_URL", "postgres://x"),
+            ("POTHOS_CALLER_SECRET", SECRET),
+            ("LLM_BASE_URL", "http://llm/v1"),
+            ("LLM_API_KEY", "sk-very-secret"),
+            ("LLM_MODEL", "m"),
+        ]))
+        .unwrap();
+        assert!(!format!("{c:?}").contains("sk-very-secret"));
+    }
+
+    #[test]
+    fn label_language_defaults_to_en_and_rejects_blank() {
+        assert_eq!(
+            label_language("[weights]\ninterests = 0.5\n").unwrap(),
+            "en"
+        );
+        assert_eq!(
+            label_language("[concepts]\nlabel_language = \"zh-Hans\"\n").unwrap(),
+            "zh-Hans"
+        );
+        let err = label_language("[concepts]\nlabel_language = \"  \"\n").unwrap_err();
+        assert!(err.contains("label_language"), "{err}");
+        // The shipped file serves both readers.
+        let shipped = include_str!("../pothos.toml");
+        assert!(Weights::parse(shipped).is_ok());
+        assert_eq!(label_language(shipped).unwrap(), "en");
     }
 }

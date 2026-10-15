@@ -43,9 +43,10 @@ pub struct CandidatesResponse {
     pub candidates: Vec<Candidate>,
 }
 
-/// Ranked candidates for one user, with the shared items as the reason.
-/// Computed on request from the two mirrors; nothing is stored. A user with no
-/// profile row, or an inactive one, is not in the pool (404).
+/// Ranked candidates for one user, with the shared concepts as the reason.
+/// Computed on request from the profiles, the mirror and the concepts derived
+/// from every phrase the engine has exported; nothing is stored. A user with
+/// no profile row, or an inactive one, is not in the pool (404).
 #[utoipa::path(
     get,
     path = "/v1/match/candidates/{user_id}",
@@ -72,17 +73,18 @@ async fn get_candidates(
         .await?
         .filter(|p| p.active)
         .ok_or(AppError::NotInPool)?;
-    let Some(me_mirror) = mirror::load(&state.pool, user_id).await? else {
+    if !mirror::exists(&state.pool, user_id).await? {
         return Ok(Json(CandidatesResponse {
             user_id,
             reason: Some("no_insights_yet"),
             candidates: Vec::new(),
         }));
-    };
+    }
+    let mine = candidates::concept_sets(&state.pool, user_id).await?;
 
     let me = Side {
-        interests: &me_mirror.interests,
-        traits: &me_mirror.personality_traits,
+        interests: &mine.interests,
+        traits: &mine.personality_traits,
         geo: Geo {
             country: me_profile.country.as_deref(),
             region: me_profile.region.as_deref(),

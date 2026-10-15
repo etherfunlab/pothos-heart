@@ -46,7 +46,10 @@ pub struct DimScores {
 pub struct Scored {
     pub score: f64,
     pub scores: DimScores,
+    /// Concept labels both users' interests fall under, sorted. Labels, not
+    /// either person's own words.
     pub shared_interests: Vec<String>,
+    /// Concept labels both users' personality traits fall under, sorted.
     pub shared_traits: Vec<String>,
     pub geo_match: Option<GeoMatch>,
 }
@@ -54,6 +57,19 @@ pub struct Scored {
 pub(crate) fn canon(s: &str) -> Option<String> {
     let c = s.trim().to_lowercase();
     (!c.is_empty()).then_some(c)
+}
+
+/// Canonical labels (`canon`), repeats dropped, first occurrence wins. The SQL
+/// hard filter compares stored phrases with exact `&&`, so everything stored
+/// takes this form.
+pub(crate) fn canonical(values: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(values.len());
+    for c in values.iter().filter_map(|v| canon(v)) {
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn as_set(items: &[String]) -> BTreeSet<String> {
