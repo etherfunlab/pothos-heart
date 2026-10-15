@@ -139,7 +139,7 @@ CREATE INDEX idx_phrase_concepts_concept ON pothos.phrase_concepts (concept);
 CREATE VIEW pothos.user_concepts AS
 SELECT o.user_id, o.dimension,
        COALESCE(pc.concept, o.phrase)          AS concept,
-       o.last_seen_at = m.engine_updated_at    AS current
+       o.last_seen_at = m.engine_updated_at    AS is_current
 FROM pothos.observed_phrases o
 JOIN pothos.insight_mirror m USING (user_id)
 LEFT JOIN pothos.phrase_decisions d USING (dimension, phrase)
