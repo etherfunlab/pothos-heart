@@ -42,10 +42,24 @@ pub async fn vocabulary(pool: &PgPool) -> sqlx::Result<Vec<String>> {
 }
 
 /// Record decisions in one transaction. Returns how many concepts were new.
+/// A phrase that already has a decision keeps it untouched.
 pub async fn record(pool: &PgPool, model: &str, decisions: &[Decision]) -> sqlx::Result<u64> {
     let mut tx = pool.begin().await?;
     let mut created = 0;
     for d in decisions {
+        let landed = sqlx::query(
+            "INSERT INTO pothos.phrase_decisions (dimension, phrase, model) VALUES ($1, $2, $3) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&d.dimension)
+        .bind(&d.phrase)
+        .bind(model)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if landed == 0 {
+            continue;
+        }
         for c in &d.concepts {
             created += sqlx::query(
                 "INSERT INTO pothos.concepts (label) VALUES ($1) ON CONFLICT DO NOTHING",
@@ -54,17 +68,6 @@ pub async fn record(pool: &PgPool, model: &str, decisions: &[Decision]) -> sqlx:
             .execute(&mut *tx)
             .await?
             .rows_affected();
-        }
-        sqlx::query(
-            "INSERT INTO pothos.phrase_decisions (dimension, phrase, model) VALUES ($1, $2, $3) \
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(&d.dimension)
-        .bind(&d.phrase)
-        .bind(model)
-        .execute(&mut *tx)
-        .await?;
-        for c in &d.concepts {
             sqlx::query(
                 "INSERT INTO pothos.phrase_concepts (dimension, phrase, concept) VALUES ($1, $2, $3) \
                  ON CONFLICT DO NOTHING",
@@ -234,5 +237,35 @@ mod tests {
                 vec!["jazz"]
             );
         }
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_phrase_already_decided_keeps_its_decision_untouched(pool: PgPool) {
+        record(
+            &pool,
+            "first",
+            &[decision("personality_traits", "n/a", &[])],
+        )
+        .await
+        .unwrap();
+        let n = record(
+            &pool,
+            "second",
+            &[decision("personality_traits", "n/a", &["smoking"])],
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "no concept coined for a decision that did not land");
+        assert!(vocabulary(&pool).await.unwrap().is_empty());
+        let mapped: i64 = sqlx::query_scalar("SELECT count(*) FROM pothos.phrase_concepts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mapped, 0);
+        let model: String =
+            sqlx::query_scalar("SELECT model FROM pothos.phrase_decisions WHERE phrase = 'n/a'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(model, "first");
     }
 }
