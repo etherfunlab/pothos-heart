@@ -46,7 +46,10 @@ pub struct DimScores {
 pub struct Scored {
     pub score: f64,
     pub scores: DimScores,
+    /// Concept labels both users' interests fall under, sorted. Labels, not
+    /// either person's own words.
     pub shared_interests: Vec<String>,
+    /// Concept labels both users' personality traits fall under, sorted.
     pub shared_traits: Vec<String>,
     pub geo_match: Option<GeoMatch>,
 }
