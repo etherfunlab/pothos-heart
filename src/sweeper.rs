@@ -1,5 +1,5 @@
-//! Pulls the engine's insights export into the mirror and the phrase ledger. Each page
-//! is committed with its cursor in one transaction, so a failure mid-walk
+//! Pulls the engine's exports into the mirror and the ledger. Each page is
+//! committed with its cursor in one transaction, so a failure mid-walk
 //! leaves the cursor at the last page that landed — never ahead of the data.
 
 use std::time::Duration;
@@ -9,6 +9,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::concepts::ConceptTask;
+use crate::db::memories;
 use crate::db::mirror::{self, MirrorRow};
 use crate::engine_client::{EngineClient, EngineError, ExportRow};
 
@@ -20,6 +21,18 @@ pub enum SweepError {
     Db(#[from] sqlx::Error),
 }
 
+/// `v` cut to at most `mirror::MAX_TEXT_BYTES`, on a char boundary.
+fn cap_text(v: &str) -> &str {
+    if v.len() <= mirror::MAX_TEXT_BYTES {
+        return v;
+    }
+    let mut end = mirror::MAX_TEXT_BYTES;
+    while !v.is_char_boundary(end) {
+        end -= 1;
+    }
+    &v[..end]
+}
+
 impl From<&ExportRow> for MirrorRow {
     fn from(r: &ExportRow) -> Self {
         // An inverted window (min > max) can match nobody, so it is dropped
@@ -28,12 +41,28 @@ impl From<&ExportRow> for MirrorRow {
             (Some(min), Some(max)) if min > max => (None, None),
             window => window,
         };
-        // Arrays are canonicalised when written (`mirror::upsert_row`).
+        // Text values are trimmed and capped, case kept; arrays are
+        // canonicalised when written (`mirror::upsert_row`).
+        let texts = mirror::TEXT_FIELDS
+            .iter()
+            .filter_map(|f| {
+                let v = r.other.get(*f)?.as_str()?.trim();
+                if v.is_empty() {
+                    return None;
+                }
+                let kept = cap_text(v);
+                if kept.len() < v.len() {
+                    tracing::warn!(user_id = %r.user_id, field = f, "text value cut to the ledger cap");
+                }
+                Some((f.to_string(), kept.to_string()))
+            })
+            .collect();
         Self {
             user_id: r.user_id,
             interests: r.interests.clone(),
             personality_traits: r.personality_traits.clone(),
             deal_breakers: r.deal_breakers.clone(),
+            texts,
             age_min,
             age_max,
             engine_updated_at: r.updated_at,
@@ -75,13 +104,43 @@ pub async fn run_once(pool: &PgPool, client: &EngineClient) -> Result<usize, Swe
     Ok(total)
 }
 
-/// Sweep forever at `interval`: mirror the export, then — when a model is
-/// configured — decide undecided phrases, whatever the mirror step did.
-/// Errors are logged; the next tick retries from wherever each step stopped.
+/// Walk the memories export from just behind its cursor to the end, like
+/// `run_once`. Returns rows received (re-fetched ones included).
+pub async fn run_memories_once(pool: &PgPool, client: &EngineClient) -> Result<usize, SweepError> {
+    let (mut since, mut after_id) = match memories::load_cursor(pool).await? {
+        Some(c) => (c.created_at - OVERLAP, Uuid::nil()),
+        None => (DateTime::<Utc>::UNIX_EPOCH, Uuid::nil()),
+    };
+    let mut total = 0;
+    loop {
+        let page = client.memory_changes(since, after_id).await?;
+        if page.memories.is_empty() {
+            break;
+        }
+        memories::apply_page(pool, &page.memories).await?;
+        total += page.memories.len();
+        let Some(next) = page.next else { break };
+        if (next.created_at, next.id) <= (since, after_id) {
+            tracing::warn!(
+                ?next,
+                "engine memories cursor did not advance; ending sweep"
+            );
+            break;
+        }
+        (since, after_id) = (next.created_at, next.id);
+    }
+    Ok(total)
+}
+
+/// Sweep forever at `interval`: mirror both exports, then run the model steps
+/// that are configured, whatever the earlier steps did. Errors are logged; the
+/// next tick retries from wherever each step stopped.
 pub async fn run_loop(
     pool: PgPool,
     client: EngineClient,
     concepts: Option<ConceptTask>,
+    autobio: Option<crate::autobio::AutobioTask>,
+    judge: Option<crate::judge::JudgeTask>,
     interval: Duration,
 ) {
     loop {
@@ -92,6 +151,18 @@ pub async fn run_loop(
             // can tell a refused connection from DNS or TLS.
             Err(e) => {
                 tracing::warn!(error = ?e, "mirror sweep failed; cursor kept at last landed page")
+            }
+        }
+        match run_memories_once(&pool, &client).await {
+            Ok(n) if n > 0 => tracing::info!(rows = n, "memories sweep"),
+            Ok(_) => tracing::debug!("memories sweep: nothing new"),
+            // An engine older than the memories export: autobio uses the
+            // insights export alone.
+            Err(SweepError::Engine(EngineError::Status(404))) => {
+                tracing::debug!("engine has no memories export; skipped")
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "memories sweep failed; cursor kept at last landed page")
             }
         }
         if let Some(task) = &concepts {
@@ -106,6 +177,36 @@ pub async fn run_loop(
                 ),
                 Ok(_) => tracing::debug!("concept step: nothing undecided"),
                 Err(e) => tracing::warn!(error = ?e, "concept step failed; phrases stay undecided"),
+            }
+        }
+        if let Some(task) = &autobio {
+            match crate::autobio::run_once(&pool, task).await {
+                Ok(r) if r.users > 0 => tracing::info!(
+                    users = r.users,
+                    failed = r.failed,
+                    added = r.added,
+                    revised = r.revised,
+                    retired = r.retired,
+                    skipped = r.skipped,
+                    tokens = r.tokens,
+                    "autobio step"
+                ),
+                Ok(_) => tracing::debug!("autobio step: nobody due"),
+                Err(e) => {
+                    tracing::warn!(error = ?e, "autobio step failed; the rest wait for the next tick")
+                }
+            }
+        }
+        if let Some(task) = &judge {
+            match crate::judge::run_once(&pool, task).await {
+                Ok(r) if r.judged + r.dropped > 0 => tracing::info!(
+                    judged = r.judged,
+                    dropped = r.dropped,
+                    tokens = r.tokens,
+                    "judge step"
+                ),
+                Ok(_) => tracing::debug!("judge step: queue empty"),
+                Err(e) => tracing::warn!(error = ?e, "judge step failed; pairs stay queued"),
             }
         }
         tokio::time::sleep(interval).await;
@@ -207,6 +308,7 @@ mod tests {
                 deal_breakers: vec![],
                 age_min: None,
                 age_max: None,
+                texts: vec![],
                 engine_updated_at: t,
             }],
         )
@@ -331,6 +433,7 @@ mod tests {
             deal_breakers: vec![],
             age_min,
             age_max,
+            other: Default::default(),
             updated_at: Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap(),
         }
     }
@@ -366,6 +469,7 @@ mod tests {
             deal_breakers: vec![],
             age_min: None,
             age_max: None,
+            texts: vec![],
             engine_updated_at: Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap(),
         }];
 
@@ -404,5 +508,152 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
         assert!(mirror::exists(&pool, a).await.unwrap());
+    }
+
+    #[test]
+    fn an_export_row_carries_the_text_columns_trimmed_and_never_preferred_gender() {
+        let row: ExportRow = serde_json::from_value(serde_json::json!({
+            "user_id": Uuid::new_v4(), "interests": [], "personality_traits": [],
+            "deal_breakers": [], "age_min": null, "age_max": null,
+            "updated_at": "2026-10-13T12:00:00Z",
+            "love_values": "  slow to warm up ", "city": "Singapore", "occupation": "   ",
+            "hometown": null, "preferred_gender": "m", "mbti_guess": 7
+        }))
+        .unwrap();
+        let mut texts = MirrorRow::from(&row).texts;
+        texts.sort();
+        assert_eq!(
+            texts,
+            vec![
+                ("city".to_string(), "Singapore".to_string()),
+                ("love_values".to_string(), "slow to warm up".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_over_long_text_value_is_cut_to_the_cap_on_a_char_boundary() {
+        let long = "爵".repeat(1400); // 4200 bytes
+        let row: ExportRow = serde_json::from_value(serde_json::json!({
+            "user_id": Uuid::new_v4(), "interests": [], "personality_traits": [],
+            "deal_breakers": [], "age_min": null, "age_max": null,
+            "updated_at": "2026-10-13T12:00:00Z",
+            "love_values": long, "city": "Singapore"
+        }))
+        .unwrap();
+        let texts = MirrorRow::from(&row).texts;
+        let love = &texts.iter().find(|(f, _)| f == "love_values").unwrap().1;
+        assert!(long.starts_with(love.as_str()));
+        assert!(love.len() <= mirror::MAX_TEXT_BYTES);
+        assert_eq!(love.chars().count(), 666);
+        assert!(texts.contains(&("city".to_string(), "Singapore".to_string())));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_over_long_text_value_does_not_stall_the_page(pool: PgPool) {
+        let server = MockServer::start().await;
+        let a = Uuid::new_v4();
+        let long = "爵".repeat(1400);
+        Mock::given(method("GET"))
+            .and(path("/svc/v1/insights/changes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "profiles": [{
+                    "user_id": a, "interests": [], "personality_traits": [],
+                    "deal_breakers": [], "age_min": null, "age_max": null,
+                    "updated_at": "2026-10-13T12:00:00Z", "love_values": long
+                }],
+                "next": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(run_once(&pool, &client(&server)).await.unwrap(), 1);
+        assert!(mirror::exists(&pool, a).await.unwrap());
+        assert_eq!(
+            mirror::current(&pool, a, "love_values").await.unwrap(),
+            vec!["爵".repeat(666)]
+        );
+    }
+
+    fn memory(id: Uuid, user: Uuid, ts: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "user_id": user, "content": "c", "category": "fact",
+            "metadata": null, "created_at": ts
+        })
+    }
+
+    async fn mirrored_memories(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM pothos.memory_mirror")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn memories_walk_two_pages_and_resume_overlap_behind(pool: PgPool) {
+        let server = MockServer::start().await;
+        let u = Uuid::new_v4();
+        let (m1, m2) = (Uuid::new_v4(), Uuid::new_v4());
+        let t1 = "2026-10-13T12:00:00Z";
+        let t2 = "2026-10-13T12:05:00Z";
+        Mock::given(method("GET"))
+            .and(path("/svc/v1/memories/changes"))
+            .and(query_param("since", "1970-01-01T00:00:00Z"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "memories": [memory(m1, u, t1)],
+                "next": { "created_at": t1, "id": m1 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/svc/v1/memories/changes"))
+            .and(query_param("since", t1))
+            .and(query_param("after_id", m1.to_string().as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "memories": [memory(m2, u, t2)], "next": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(run_memories_once(&pool, &client(&server)).await.unwrap(), 2);
+        assert_eq!(mirrored_memories(&pool).await, 2);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/svc/v1/memories/changes"))
+            .and(query_param("since", "2026-10-13T12:04:55Z"))
+            .and(query_param(
+                "after_id",
+                "00000000-0000-0000-0000-000000000000",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                // The overlap re-returns a row already stored: a no-op.
+                "memories": [memory(m2, u, t2)], "next": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(run_memories_once(&pool, &client(&server)).await.unwrap(), 1);
+        assert_eq!(mirrored_memories(&pool).await, 2);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn memories_404_leaves_cursor_and_mirror_untouched(pool: PgPool) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let err = run_memories_once(&pool, &client(&server))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SweepError::Engine(EngineError::Status(404))));
+        assert!(crate::db::memories::load_cursor(&pool)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(mirrored_memories(&pool).await, 0);
     }
 }

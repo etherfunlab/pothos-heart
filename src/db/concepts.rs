@@ -19,12 +19,14 @@ pub struct Decision {
     pub concepts: Vec<String>,
 }
 
-/// Undecided phrases, each once, oldest first.
+/// Undecided array phrases, each once, oldest first. Text-column rows share
+/// the ledger but never get concepts.
 pub async fn undecided(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<Pending>> {
     sqlx::query_as(
         "SELECT o.dimension, o.phrase FROM pothos.observed_phrases o \
          LEFT JOIN pothos.phrase_decisions d USING (dimension, phrase) \
          WHERE d.phrase IS NULL \
+           AND o.dimension IN ('interests', 'personality_traits', 'deal_breakers') \
          GROUP BY o.dimension, o.phrase \
          ORDER BY min(o.first_seen_at), o.dimension, o.phrase \
          LIMIT $1",
@@ -107,6 +109,7 @@ mod tests {
                 deal_breakers: deal.iter().map(|s| s.to_string()).collect(),
                 age_min: None,
                 age_max: None,
+                texts: vec![],
                 engine_updated_at: t,
             },
         )
@@ -267,5 +270,32 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(model, "first");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn text_columns_never_reach_the_concept_step_or_matching(pool: PgPool) {
+        let a = Uuid::new_v4();
+        export(&pool, a, at(0), &["jazz"], &[]).await;
+        sqlx::query(
+            "INSERT INTO pothos.observed_phrases (user_id, dimension, phrase, first_seen_at, last_seen_at) \
+             VALUES ($1, 'love_values', 'wants to be understood', $2, $2)",
+        )
+        .bind(a)
+        .bind(at(0))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            undecided(&pool, 10).await.unwrap(),
+            vec![pending("interests", "jazz")]
+        );
+        let n: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM pothos.user_concepts WHERE user_id = $1")
+                .bind(a)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 1, "only the interest");
     }
 }

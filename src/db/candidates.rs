@@ -158,6 +158,7 @@ mod tests {
                 deal_breakers: deal.iter().map(|s| s.to_string()).collect(),
                 age_min: age.map(|a| a.0),
                 age_max: age.map(|a| a.1),
+                texts: vec![],
                 engine_updated_at: Utc::now(),
             },
         )
@@ -191,6 +192,7 @@ mod tests {
                 deal_breakers: deal.iter().map(|s| s.to_string()).collect(),
                 age_min: None,
                 age_max: None,
+                texts: vec![],
                 engine_updated_at: t,
             },
         )

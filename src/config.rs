@@ -8,6 +8,9 @@ use std::time::Duration;
 use serde::Deserialize;
 
 pub const MIN_CALLER_SECRET_LEN: usize = 32;
+/// One year; a longer minimum interval would overflow the sweeper's clock
+/// arithmetic and means "never" anyway.
+const MAX_AUTOBIO_MIN_INTERVAL_SECS: u64 = 31_536_000;
 
 #[derive(Clone)]
 pub struct EngineConfig {
@@ -32,6 +35,17 @@ pub struct LlmConfig {
     pub model: String,
 }
 
+impl LlmConfig {
+    /// The same endpoint and key, with `model` in place of `LLM_MODEL` when given.
+    pub fn with_model(&self, model: Option<&str>) -> Self {
+        let mut c = self.clone();
+        if let Some(m) = model {
+            c.model = m.to_string();
+        }
+        c
+    }
+}
+
 impl std::fmt::Debug for LlmConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LlmConfig")
@@ -52,6 +66,12 @@ pub struct Config {
     pub weights_path: PathBuf,
     pub llm: Option<LlmConfig>,
     pub concept_max_per_tick: i64,
+    pub autobio_max_per_tick: i64,
+    pub autobio_min_interval: Duration,
+    pub autobio_model: Option<String>,
+    pub judge_max_per_tick: i64,
+    pub judge_top_k: usize,
+    pub judge_model: Option<String>,
 }
 
 impl std::fmt::Debug for Config {
@@ -67,6 +87,12 @@ impl std::fmt::Debug for Config {
             .field("weights_path", &self.weights_path)
             .field("llm", &self.llm)
             .field("concept_max_per_tick", &self.concept_max_per_tick)
+            .field("autobio_max_per_tick", &self.autobio_max_per_tick)
+            .field("autobio_min_interval", &self.autobio_min_interval)
+            .field("autobio_model", &self.autobio_model)
+            .field("judge_max_per_tick", &self.judge_max_per_tick)
+            .field("judge_top_k", &self.judge_top_k)
+            .field("judge_model", &self.judge_model)
             .finish()
     }
 }
@@ -106,6 +132,28 @@ fn truthy(v: Option<String>) -> bool {
         v.as_deref().map(str::trim),
         Some("1") | Some("true") | Some("yes")
     )
+}
+
+/// A positive integer from `value`, or `default` when unset.
+fn positive(value: Option<String>, name: &str, default: i64) -> Result<i64, String> {
+    match value {
+        None => Ok(default),
+        Some(s) => match s.parse::<i64>() {
+            Ok(n) if n >= 1 => Ok(n),
+            _ => Err(format!("{name} must be a positive integer: {s}")),
+        },
+    }
+}
+
+/// A non-negative integer from `value`, or `default` when unset.
+fn non_negative(value: Option<String>, name: &str, default: i64) -> Result<i64, String> {
+    match value {
+        None => Ok(default),
+        Some(s) => match s.parse::<i64>() {
+            Ok(n) if n >= 0 => Ok(n),
+            _ => Err(format!("{name} must be a non-negative integer: {s}")),
+        },
+    }
 }
 
 impl Config {
@@ -176,16 +224,30 @@ impl Config {
             }
         };
 
-        let concept_max_per_tick = match nonblank("CONCEPT_MAX_PER_TICK") {
-            None => 200,
-            Some(s) => match s.parse::<i64>() {
-                Ok(n) if n >= 1 => n,
-                _ => {
+        let concept_max_per_tick = positive(
+            nonblank("CONCEPT_MAX_PER_TICK"),
+            "CONCEPT_MAX_PER_TICK",
+            200,
+        )?;
+        // Zero turns that model step off.
+        let autobio_max_per_tick =
+            non_negative(nonblank("AUTOBIO_MAX_PER_TICK"), "AUTOBIO_MAX_PER_TICK", 50)?;
+        let judge_max_per_tick =
+            non_negative(nonblank("JUDGE_MAX_PER_TICK"), "JUDGE_MAX_PER_TICK", 100)?;
+        let judge_top_k = positive(nonblank("JUDGE_TOP_K"), "JUDGE_TOP_K", 10)? as usize;
+        let autobio_min_interval = match nonblank("AUTOBIO_MIN_INTERVAL_SECS") {
+            None => Duration::from_secs(3600),
+            Some(s) => {
+                let secs: u64 = s
+                    .parse()
+                    .map_err(|_| format!("AUTOBIO_MIN_INTERVAL_SECS is not a number: {s}"))?;
+                if secs > MAX_AUTOBIO_MIN_INTERVAL_SECS {
                     return Err(format!(
-                        "CONCEPT_MAX_PER_TICK must be a positive integer: {s}"
-                    ))
+                        "AUTOBIO_MIN_INTERVAL_SECS must be at most {MAX_AUTOBIO_MIN_INTERVAL_SECS} (one year): {s}"
+                    ));
                 }
-            },
+                Duration::from_secs(secs)
+            }
         };
 
         Ok(Self {
@@ -199,6 +261,12 @@ impl Config {
                 .unwrap_or_else(|| "pothos.toml".into()),
             llm,
             concept_max_per_tick,
+            autobio_max_per_tick,
+            autobio_min_interval,
+            autobio_model: nonblank("AUTOBIO_MODEL"),
+            judge_max_per_tick,
+            judge_top_k,
+            judge_model: nonblank("JUDGE_MODEL"),
         })
     }
 }
@@ -305,6 +373,43 @@ pub fn load_label_language(path: &Path) -> Result<String, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read weights file {}: {e}", path.display()))?;
     label_language(&text)
+}
+
+#[derive(Deserialize, Default)]
+struct AutobioFile {
+    #[serde(default)]
+    autobio: AutobioSection,
+}
+
+#[derive(Deserialize)]
+struct AutobioSection {
+    #[serde(default = "default_label_language")]
+    language: String,
+}
+
+impl Default for AutobioSection {
+    fn default() -> Self {
+        Self {
+            language: default_label_language(),
+        }
+    }
+}
+
+/// `[autobio] language`: the language entries and judge rationales are
+/// written in. `en` when absent.
+pub fn autobio_language(toml_text: &str) -> Result<String, String> {
+    let f: AutobioFile = toml::from_str(toml_text).map_err(|e| format!("pothos toml: {e}"))?;
+    let lang = f.autobio.language.trim().to_string();
+    if lang.is_empty() {
+        return Err("autobio.language must not be blank".into());
+    }
+    Ok(lang)
+}
+
+pub fn load_autobio_language(path: &Path) -> Result<String, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read weights file {}: {e}", path.display()))?;
+    autobio_language(&text)
 }
 
 #[cfg(test)]
@@ -521,5 +626,139 @@ mod tests {
         let shipped = include_str!("../pothos.toml");
         assert!(Weights::parse(shipped).is_ok());
         assert_eq!(label_language(shipped).unwrap(), "en");
+    }
+
+    #[test]
+    fn autobio_settings_default_and_validate() {
+        let base = [
+            ("DATABASE_URL", "postgres://x"),
+            ("POTHOS_CALLER_SECRET", SECRET),
+        ];
+        let c = Config::parse(env(&base)).unwrap();
+        assert_eq!(c.autobio_max_per_tick, 50);
+        assert_eq!(c.autobio_min_interval, Duration::from_secs(3600));
+        assert!(c.autobio_model.is_none());
+
+        for (k, bad) in [
+            ("AUTOBIO_MAX_PER_TICK", "-1"),
+            ("AUTOBIO_MAX_PER_TICK", "x"),
+            ("AUTOBIO_MIN_INTERVAL_SECS", "-1"),
+        ] {
+            let mut all = base.to_vec();
+            all.push((k, bad));
+            let err = Config::parse(env(&all)).unwrap_err();
+            assert!(err.contains(k), "{k}={bad}: {err}");
+        }
+
+        // Zero turns the step off.
+        let mut all = base.to_vec();
+        all.push(("AUTOBIO_MAX_PER_TICK", "0"));
+        assert_eq!(Config::parse(env(&all)).unwrap().autobio_max_per_tick, 0);
+
+        let mut all = base.to_vec();
+        all.extend([
+            ("AUTOBIO_MAX_PER_TICK", "5"),
+            ("AUTOBIO_MIN_INTERVAL_SECS", "0"),
+            ("AUTOBIO_MODEL", "big-model"),
+        ]);
+        let c = Config::parse(env(&all)).unwrap();
+        assert_eq!(c.autobio_max_per_tick, 5);
+        assert_eq!(c.autobio_min_interval, Duration::ZERO);
+        assert_eq!(c.autobio_model.as_deref(), Some("big-model"));
+    }
+
+    #[test]
+    fn autobio_min_interval_is_bounded_to_a_year() {
+        let base = [
+            ("DATABASE_URL", "postgres://x"),
+            ("POTHOS_CALLER_SECRET", SECRET),
+        ];
+        let mut all = base.to_vec();
+        all.push(("AUTOBIO_MIN_INTERVAL_SECS", "31536000"));
+        assert_eq!(
+            Config::parse(env(&all)).unwrap().autobio_min_interval,
+            Duration::from_secs(31_536_000)
+        );
+        for bad in ["31536001", "18446744073709551615"] {
+            let mut all = base.to_vec();
+            all.push(("AUTOBIO_MIN_INTERVAL_SECS", bad));
+            let err = Config::parse(env(&all)).unwrap_err();
+            assert!(err.contains("AUTOBIO_MIN_INTERVAL_SECS"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn judge_settings_default_and_validate() {
+        let base = [
+            ("DATABASE_URL", "postgres://x"),
+            ("POTHOS_CALLER_SECRET", SECRET),
+        ];
+        let c = Config::parse(env(&base)).unwrap();
+        assert_eq!(c.judge_max_per_tick, 100);
+        assert!(c.judge_model.is_none());
+        for bad in ["-1", "x"] {
+            let mut all = base.to_vec();
+            all.push(("JUDGE_MAX_PER_TICK", bad));
+            let err = Config::parse(env(&all)).unwrap_err();
+            assert!(err.contains("JUDGE_MAX_PER_TICK"), "{bad}: {err}");
+        }
+        // Zero turns the step off.
+        let mut all = base.to_vec();
+        all.push(("JUDGE_MAX_PER_TICK", "0"));
+        assert_eq!(Config::parse(env(&all)).unwrap().judge_max_per_tick, 0);
+        let mut all = base.to_vec();
+        all.push(("JUDGE_MODEL", "judge-model"));
+        assert_eq!(
+            Config::parse(env(&all)).unwrap().judge_model.as_deref(),
+            Some("judge-model")
+        );
+    }
+
+    #[test]
+    fn judge_top_k_defaults_to_10_and_must_be_positive() {
+        let base = [
+            ("DATABASE_URL", "postgres://x"),
+            ("POTHOS_CALLER_SECRET", SECRET),
+        ];
+        assert_eq!(Config::parse(env(&base)).unwrap().judge_top_k, 10);
+        let mut all = base.to_vec();
+        all.push(("JUDGE_TOP_K", "0"));
+        assert!(Config::parse(env(&all))
+            .unwrap_err()
+            .contains("JUDGE_TOP_K"));
+    }
+
+    #[test]
+    fn with_model_overrides_only_the_model() {
+        let c = LlmConfig {
+            base_url: "http://llm".into(),
+            api_key: "k".into(),
+            model: "m".into(),
+        };
+        let o = c.with_model(Some("other"));
+        assert_eq!(
+            (o.base_url.as_str(), o.api_key.as_str(), o.model.as_str()),
+            ("http://llm", "k", "other")
+        );
+        assert_eq!(c.with_model(None).model, "m");
+    }
+
+    #[test]
+    fn autobio_language_defaults_to_en_and_rejects_blank() {
+        assert_eq!(
+            autobio_language("[weights]\ninterests = 0.5\n").unwrap(),
+            "en"
+        );
+        assert_eq!(
+            autobio_language("[autobio]\nlanguage = \"zh-Hans\"\n").unwrap(),
+            "zh-Hans"
+        );
+        assert!(autobio_language("[autobio]\nlanguage = \" \"\n")
+            .unwrap_err()
+            .contains("autobio.language"));
+        assert_eq!(
+            autobio_language(include_str!("../pothos.toml")).unwrap(),
+            "en"
+        );
     }
 }

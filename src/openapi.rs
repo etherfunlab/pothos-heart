@@ -31,7 +31,8 @@ impl Modify for SecurityAddon {
     tags(
         (name = "health", description = "Liveness"),
         (name = "profiles", description = "Hard attributes pushed by the product layer"),
-        (name = "match", description = "Ranked candidates")
+        (name = "match", description = "Ranked candidates"),
+        (name = "autobio", description = "The owner's view of their autobio")
     ),
     modifiers(&SecurityAddon)
 )]

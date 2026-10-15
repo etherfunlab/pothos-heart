@@ -55,13 +55,26 @@ pub async fn upsert(pool: &PgPool, user_id: Uuid, w: &ProfileWrite) -> sqlx::Res
     Ok(())
 }
 
-/// `true` if a row was removed.
+/// Leave the pool. The user's autobio, its state, and every verdict or queued
+/// pair naming them are deleted in the same transaction, whether or not a
+/// profile row was there, so a repeated DELETE still clears leftovers. The
+/// mirrors stay. `true` if a profile row was removed.
 pub async fn delete(pool: &PgPool, user_id: Uuid) -> sqlx::Result<bool> {
+    let mut tx = pool.begin().await?;
     let n = sqlx::query("DELETE FROM pothos.match_profiles WHERE user_id = $1")
         .bind(user_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+    for sql in [
+        "DELETE FROM pothos.autobio_entries WHERE user_id = $1",
+        "DELETE FROM pothos.autobio_state WHERE user_id = $1",
+        "DELETE FROM pothos.pair_verdicts WHERE user_lo = $1 OR user_hi = $1",
+        "DELETE FROM pothos.judge_queue WHERE user_lo = $1 OR user_hi = $1",
+    ] {
+        sqlx::query(sql).bind(user_id).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
     Ok(n > 0)
 }
 

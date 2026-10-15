@@ -31,6 +31,17 @@ impl LlmError {
             Self::NoContent => false,
         }
     }
+
+    /// The provider refused this one request (moderation, context length, a
+    /// reply with no content) rather than being unreachable or refusing every
+    /// request: any 4xx except 401, 402, 408 and 429, or no content.
+    pub fn rejects_request(&self) -> bool {
+        match self {
+            Self::Status(s) => (400..500).contains(s) && !matches!(s, 401 | 402 | 408 | 429),
+            Self::Http(_) => false,
+            Self::NoContent => true,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -50,6 +61,11 @@ pub struct LlmClient {
 impl LlmClient {
     pub fn new(cfg: &LlmConfig) -> Self {
         Self::build(cfg, Duration::from_secs(60), Duration::from_secs(2))
+    }
+
+    /// Like `new`, with `timeout` for replies that can take longer than 60 s.
+    pub fn with_timeout(cfg: &LlmConfig, timeout: Duration) -> Self {
+        Self::build(cfg, timeout, Duration::from_secs(2))
     }
 
     /// A short timeout and no wait between retries, for tests across the crate.
@@ -130,6 +146,18 @@ impl LlmClient {
     }
 }
 
+/// The outermost `{…}` of a model reply, parsed. Tolerates a code fence or
+/// prose around it, since providers differ on `response_format`.
+pub fn json_object(content: &str) -> Result<serde_json::Value, String> {
+    let (Some(start), Some(end)) = (content.find('{'), content.rfind('}')) else {
+        return Err("no JSON object in the reply".into());
+    };
+    if end < start {
+        return Err("no JSON object in the reply".into());
+    }
+    serde_json::from_str(&content[start..=end]).map_err(|e| e.to_string())
+}
+
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
@@ -173,6 +201,31 @@ mod tests {
             "choices": [{"message": {"role": "assistant", "content": content}}],
             "usage": {"prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42}
         }))
+    }
+
+    #[test]
+    fn only_a_refusal_of_this_one_request_rejects_it() {
+        for s in [400, 403, 404, 413, 422] {
+            assert!(LlmError::Status(s).rejects_request(), "{s}");
+        }
+        assert!(LlmError::NoContent.rejects_request());
+        for s in [401, 402, 408, 429, 500, 503] {
+            assert!(!LlmError::Status(s).rejects_request(), "{s}");
+        }
+    }
+
+    #[test]
+    fn json_object_reads_fenced_or_wrapped_replies() {
+        for content in [
+            r#"{"a":1}"#.to_string(),
+            "```json\n{\"a\":1}\n```".to_string(),
+            "Sure:\n{\"a\":1}\nDone.".to_string(),
+        ] {
+            assert_eq!(json_object(&content).unwrap()["a"], 1, "{content}");
+        }
+        for bad in ["no json", "} {", "{not json}"] {
+            assert!(json_object(bad).is_err(), "{bad}");
+        }
     }
 
     #[tokio::test]

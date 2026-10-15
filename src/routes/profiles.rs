@@ -105,7 +105,7 @@ async fn put_profile(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Remove a user from the match pool.
+/// Remove a user from the match pool. Their autobio and every verdict naming them are deleted with it; the mirrored engine data stays.
 #[utoipa::path(
     delete,
     path = "/v1/profiles/{user_id}",
@@ -380,6 +380,117 @@ mod tests {
                 .is_some(),
             "DELETE removes only the addressed user"
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn leaving_the_pool_removes_autobio_data_but_not_the_mirrors(pool: sqlx::PgPool) {
+        use crate::db::autobio::tests::{at, entry, export};
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for id in [a, b] {
+            send(
+                pool.clone(),
+                "PUT",
+                &format!("/v1/profiles/{id}"),
+                Some(valid()),
+            )
+            .await;
+            entry(&pool, id, "life", "x").await;
+        }
+        export(&pool, a, at(0), &[("city", "Singapore")]).await;
+        sqlx::query(
+            "INSERT INTO pothos.autobio_state (user_id, material_until, ran_at, model) VALUES ($1, now(), now(), 'm')",
+        )
+        .bind(a)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (lo, hi) = crate::db::verdicts::pair(a, b);
+        let (lo2, hi2) = crate::db::verdicts::pair(b, c);
+        for (x, y) in [(lo, hi), (lo2, hi2)] {
+            sqlx::query(
+                "INSERT INTO pothos.pair_verdicts (user_lo, user_hi, lo_version, hi_version, grade, rationale, model) \
+                 VALUES ($1, $2, now(), now(), 'promising', 'r', 'm')",
+            )
+            .bind(x)
+            .bind(y)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO pothos.judge_queue (user_lo, user_hi) VALUES ($1, $2)")
+                .bind(x)
+                .bind(y)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let (status, _) = send(pool.clone(), "DELETE", &format!("/v1/profiles/{a}"), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let count = |sql: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(sql)
+                    .bind(a)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(
+            count("SELECT count(*) FROM pothos.autobio_entries WHERE user_id = $1").await,
+            0
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM pothos.autobio_state WHERE user_id = $1").await,
+            0
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM pothos.pair_verdicts WHERE user_lo = $1 OR user_hi = $1")
+                .await,
+            0
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM pothos.judge_queue WHERE user_lo = $1 OR user_hi = $1")
+                .await,
+            0
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM pothos.observed_phrases WHERE user_id = $1").await,
+            1,
+            "mirror kept"
+        );
+        let others: i64 = sqlx::query_scalar("SELECT count(*) FROM pothos.pair_verdicts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(others, 1, "the b–c verdict stays");
+        assert_eq!(
+            crate::db::autobio::current_entries(&pool, b)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_repeated_delete_clears_leftovers_and_still_404s(pool: sqlx::PgPool) {
+        use crate::db::autobio::tests::entry;
+        let a = Uuid::new_v4();
+        // Left already: no profile row, but an autobio entry survived.
+        entry(&pool, a, "life", "x").await;
+
+        let (status, body) = send(pool.clone(), "DELETE", &format!("/v1/profiles/{a}"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_in_pool");
+        let left: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM pothos.autobio_entries WHERE user_id = $1")
+                .bind(a)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(left, 0, "the leftover entry is removed");
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -10,7 +10,7 @@ use utoipa::ToSchema;
 /// The body of every error response.
 #[derive(Serialize, ToSchema)]
 pub struct ErrorBody {
-    /// Machine-readable code: `bad_request`, `forbidden`, `not_in_pool` or `internal`.
+    /// Machine-readable code: `bad_request`, `forbidden`, `not_in_pool`, `entry_not_found` or `internal`.
     pub error: String,
     /// Human-readable detail.
     pub message: String,
@@ -24,6 +24,8 @@ pub enum AppError {
     BadRequest(String),
     #[error("user is not in the match pool")]
     NotInPool,
+    #[error("no such current entry for this user")]
+    EntryNotFound,
     #[error("database error")]
     Sqlx(#[from] sqlx::Error),
 }
@@ -48,6 +50,7 @@ impl IntoResponse for AppError {
             AppError::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             AppError::NotInPool => (StatusCode::NOT_FOUND, "not_in_pool"),
+            AppError::EntryNotFound => (StatusCode::NOT_FOUND, "entry_not_found"),
             AppError::Sqlx(e) => {
                 tracing::error!(error = %e, "database error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal")

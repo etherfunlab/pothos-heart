@@ -1,6 +1,6 @@
 //! The engine's `GET /svc/v1/insights/changes`, as this service consumes it:
-//! the five matching columns out of the 21 the export returns, plus the
-//! keyset cursor. Unknown fields are ignored on purpose.
+//! the matching columns and the text columns out of the 21 the export
+//! returns, plus the keyset cursor.
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -20,6 +20,10 @@ pub struct ExportRow {
     pub age_min: Option<i32>,
     pub age_max: Option<i32>,
     pub updated_at: DateTime<Utc>,
+    /// Every key not named above: the text columns `mirror::TEXT_FIELDS`
+    /// are read from here; the rest is ignored.
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -32,6 +36,30 @@ pub struct Cursor {
 pub struct ChangesPage {
     pub profiles: Vec<ExportRow>,
     pub next: Option<Cursor>,
+}
+
+/// One extracted memory from `GET /svc/v1/memories/changes`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryRow {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub content: String,
+    pub category: String,
+    /// The extractor's hints (`domain`, `evidence_type`, …), kept verbatim.
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub struct MemoryCursor {
+    pub created_at: DateTime<Utc>,
+    pub id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MemoryPage {
+    pub memories: Vec<MemoryRow>,
+    pub next: Option<MemoryCursor>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -75,9 +103,34 @@ impl EngineClient {
         since: DateTime<Utc>,
         after_user: Uuid,
     ) -> Result<ChangesPage, EngineError> {
+        self.page(
+            "/svc/v1/insights/changes",
+            since,
+            ("after_user", after_user),
+        )
+        .await
+    }
+
+    /// One page of extracted memories strictly after `(since, after_id)`. An
+    /// engine without this export answers 404.
+    pub async fn memory_changes(
+        &self,
+        since: DateTime<Utc>,
+        after_id: Uuid,
+    ) -> Result<MemoryPage, EngineError> {
+        self.page("/svc/v1/memories/changes", since, ("after_id", after_id))
+            .await
+    }
+
+    async fn page<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        since: DateTime<Utc>,
+        (after_key, after): (&str, Uuid),
+    ) -> Result<T, EngineError> {
         let res = self
             .http
-            .get(format!("{}/svc/v1/insights/changes", self.base_url))
+            .get(format!("{}{path}", self.base_url))
             .header(EXPORT_SECRET_HEADER, self.secret.clone())
             .query(&[
                 // AutoSi keeps the engine's microsecond precision; a truncated
@@ -88,7 +141,7 @@ impl EngineClient {
                     "since",
                     since.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
                 ),
-                ("after_user", after_user.to_string()),
+                (after_key, after.to_string()),
                 ("limit", PAGE_LIMIT.to_string()),
             ])
             .send()
@@ -96,7 +149,7 @@ impl EngineClient {
         if !res.status().is_success() {
             return Err(EngineError::Status(res.status().as_u16()));
         }
-        Ok(res.json::<ChangesPage>().await?)
+        Ok(res.json::<T>().await?)
     }
 }
 
@@ -166,6 +219,59 @@ mod tests {
         let next = page.next.unwrap();
         assert_eq!(next.user_id, id);
         assert_eq!(next.updated_at, ts);
+    }
+
+    #[tokio::test]
+    async fn memory_changes_sends_cursor_and_secret_and_parses_rows() {
+        let server = MockServer::start().await;
+        let (m, u) = (Uuid::new_v4(), Uuid::new_v4());
+        Mock::given(method("GET"))
+            .and(path("/svc/v1/memories/changes"))
+            .and(header(EXPORT_SECRET_HEADER, "s".repeat(32).as_str()))
+            .and(query_param("since", "1970-01-01T00:00:00Z"))
+            .and(query_param(
+                "after_id",
+                "00000000-0000-0000-0000-000000000000",
+            ))
+            .and(query_param("limit", "1000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "memories": [{
+                    "id": m, "user_id": u, "content": "用户周末常去爬山",
+                    "category": "preference",
+                    "metadata": {"domain": "hobby", "evidence_type": "explicit_statement"},
+                    "created_at": "2026-10-13T12:00:00Z"
+                }],
+                "next": { "created_at": "2026-10-13T12:00:00Z", "id": m }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let page = EngineClient::new(&cfg(&server))
+            .memory_changes(DateTime::<Utc>::UNIX_EPOCH, Uuid::nil())
+            .await
+            .unwrap();
+        assert_eq!(page.memories.len(), 1);
+        assert_eq!(page.memories[0].id, m);
+        assert_eq!(
+            page.memories[0].metadata.as_ref().unwrap()["domain"],
+            "hobby"
+        );
+        assert_eq!(page.next.unwrap().id, m);
+    }
+
+    #[tokio::test]
+    async fn an_engine_without_the_memories_export_is_a_404_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let err = EngineClient::new(&cfg(&server))
+            .memory_changes(DateTime::<Utc>::UNIX_EPOCH, Uuid::nil())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Status(404)));
     }
 
     #[tokio::test]

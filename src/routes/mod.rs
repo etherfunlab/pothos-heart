@@ -8,6 +8,7 @@ use utoipa_axum::router::OpenApiRouter;
 use crate::auth::require_caller_secret;
 use crate::state::AppState;
 
+pub mod autobio;
 pub mod candidates;
 pub mod health;
 pub mod profiles;
@@ -18,6 +19,7 @@ fn v1_routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .merge(profiles::router())
         .merge(candidates::router())
+        .merge(autobio::router())
 }
 
 pub fn router(state: AppState) -> OpenApiRouter<AppState> {
@@ -40,7 +42,7 @@ pub fn build_app(state: AppState) -> Router {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn openapi_lists_the_three_v1_routes_and_healthz() {
+    fn openapi_lists_the_v1_routes_and_healthz() {
         use utoipa::OpenApi;
         let (_r, api) = super::router_for_openapi().split_for_parts();
         let mut doc = crate::openapi::ApiDoc::openapi();
@@ -50,6 +52,8 @@ mod tests {
             "/healthz",
             "/v1/profiles/{user_id}",
             "/v1/match/candidates/{user_id}",
+            "/v1/autobio/{user_id}",
+            "/v1/autobio/{user_id}/entries/{entry_id}",
         ] {
             assert!(v["paths"][p].is_object(), "{p}");
         }

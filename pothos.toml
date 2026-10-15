@@ -17,3 +17,7 @@ country = 0.3
 # labels are reused whatever language a phrase is in.
 [concepts]
 label_language = "en"
+
+# Autobio and judge: the language entries and rationales are written in.
+[autobio]
+language = "en"

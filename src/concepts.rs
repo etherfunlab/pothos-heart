@@ -79,14 +79,7 @@ pub fn user_prompt(vocabulary: &[String], batch: &[Pending]) -> String {
 /// undecided. Each entry is validated alone; `Err` only when the reply holds
 /// no readable `results` object at all.
 pub fn parse(content: &str, batch: &[Pending]) -> Result<(Vec<Decision>, usize), String> {
-    let (Some(start), Some(end)) = (content.find('{'), content.rfind('}')) else {
-        return Err("no JSON object in the reply".into());
-    };
-    if end < start {
-        return Err("no JSON object in the reply".into());
-    }
-    let v: serde_json::Value =
-        serde_json::from_str(&content[start..=end]).map_err(|e| e.to_string())?;
+    let v = crate::llm::json_object(content)?;
     let items = v
         .get("results")
         .and_then(|r| r.as_array())
@@ -313,6 +306,7 @@ mod tests {
                 deal_breakers: vec![],
                 age_min: None,
                 age_max: None,
+                texts: vec![],
                 engine_updated_at: Utc.with_ymd_and_hms(2026, 10, 15, 12, 0, 0).unwrap(),
             },
         )

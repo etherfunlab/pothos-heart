@@ -1,4 +1,6 @@
-//! The match: hard filter in SQL, soft score in Rust, nothing persisted.
+//! The match: hard filter in SQL, soft score in Rust, then the judge's cached
+//! grades rerank the list. Match state is the product layer's; only the
+//! judge's verdicts are stored here.
 
 use axum::extract::rejection::{PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
@@ -8,7 +10,8 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
-use crate::db::{candidates, mirror, profiles};
+use crate::db::verdicts::Grade;
+use crate::db::{autobio, candidates, mirror, profiles, verdicts};
 use crate::error::{AppError, ErrorBody};
 use crate::scoring::{self, Geo, Scored, Side};
 use crate::state::AppState;
@@ -32,6 +35,10 @@ pub struct Candidate {
     pub user_id: Uuid,
     #[serde(flatten)]
     pub scored: Scored,
+    /// The judge's grade for this pair, read from both autobios: `strong`,
+    /// `promising`, `unclear` or `poor`; `null` until judged. A grade is
+    /// shown while a newer one is pending.
+    pub chemistry: Option<Grade>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -44,9 +51,10 @@ pub struct CandidatesResponse {
 }
 
 /// Ranked candidates for one user, with the shared concepts as the reason.
-/// Computed on request from the profiles, the mirror and the concepts derived
-/// from every phrase the engine has exported; nothing is stored. A user with
-/// no profile row, or an inactive one, is not in the pool (404).
+/// With a model configured, each candidate also carries the judge's grade when
+/// there is one, the list is reordered by it, and the pairs among the top
+/// `JUDGE_TOP_K` candidates without a fresh grade are queued for the judge.
+/// A user with no profile row, or an inactive one, is not in the pool (404).
 #[utoipa::path(
     get,
     path = "/v1/match/candidates/{user_id}",
@@ -108,6 +116,7 @@ async fn get_candidates(
             Candidate {
                 user_id: c.user_id,
                 scored: scoring::score(&state.weights, &me, &other),
+                chemistry: None,
             }
         })
         .collect();
@@ -119,6 +128,37 @@ async fn get_candidates(
             .then_with(|| a.user_id.cmp(&b.user_id))
     });
     ranked.truncate(limit);
+
+    // The judge is part of the model steps: with no model configured the
+    // heuristic order stands and every `chemistry` stays null.
+    if state.config.llm.is_some() {
+        let ids: Vec<Uuid> = ranked.iter().map(|c| c.user_id).collect();
+        let graded = verdicts::for_candidates(&state.pool, user_id, &ids).await?;
+        let mut users = ids.clone();
+        users.push(user_id);
+        let with_autobio = autobio::versions(&state.pool, &users).await?;
+        if with_autobio.contains_key(&user_id) {
+            let due: Vec<Uuid> = ids
+                .iter()
+                .take(state.config.judge_top_k)
+                .filter(|id| {
+                    with_autobio.contains_key(*id) && !graded.get(*id).is_some_and(|v| v.fresh)
+                })
+                .copied()
+                .collect();
+            verdicts::enqueue(&state.pool, user_id, &due).await?;
+        }
+        for c in &mut ranked {
+            c.chemistry = graded.get(&c.user_id).map(|v| v.grade);
+        }
+        // Grade first (unjudged ranks with unclear, poor last), then score, then id.
+        ranked.sort_by(|a, b| {
+            Grade::rank(a.chemistry)
+                .cmp(&Grade::rank(b.chemistry))
+                .then_with(|| b.scored.score.total_cmp(&a.scored.score))
+                .then_with(|| a.user_id.cmp(&b.user_id))
+        });
+    }
 
     Ok(Json(CandidatesResponse {
         user_id,
@@ -215,6 +255,7 @@ mod tests {
                 deal_breakers: vec![],
                 age_min: None,
                 age_max: None,
+                texts: vec![],
                 engine_updated_at: Utc::now(),
             },
         )
@@ -388,5 +429,183 @@ mod tests {
         let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"], "forbidden");
+    }
+
+    async fn get_with(state: crate::state::AppState, uri: &str) -> serde_json::Value {
+        let res = build_app(state)
+            .oneshot(
+                Request::get(uri)
+                    .header(CALLER_SECRET_HEADER, TEST_SECRET)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn judged(pool: &PgPool, me: Uuid, other: Uuid, grade: crate::db::verdicts::Grade) {
+        use crate::db::{autobio, verdicts};
+        let v = autobio::versions(pool, &[me, other]).await.unwrap();
+        let (lo, hi) = verdicts::pair(me, other);
+        assert!(
+            verdicts::store(pool, lo, hi, v[&lo], v[&hi], grade, "r", "m")
+                .await
+                .unwrap()
+        );
+    }
+
+    async fn queued(pool: &PgPool) -> Vec<(Uuid, Uuid)> {
+        crate::db::verdicts::take(pool, 100).await.unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn chemistry_reranks_the_list_and_never_carries_the_rationale(pool: PgPool) {
+        use crate::db::autobio::tests::entry;
+        use crate::db::verdicts::Grade;
+        let me = profile(&pool, "f", &["m"], None).await;
+        mirror(&pool, me, &["a", "b", "c", "d"], &[]).await;
+        // Same-size sets, so the overlap coefficient (|A∩B| / min) orders
+        // them: best 4/4 > mid 2/4 > low 1/4 > lowest 0/4.
+        let best = profile(&pool, "m", &["f"], None).await;
+        mirror(&pool, best, &["a", "b", "c", "d"], &[]).await;
+        let mid = profile(&pool, "m", &["f"], None).await;
+        mirror(&pool, mid, &["a", "b", "x", "y"], &[]).await;
+        let low = profile(&pool, "m", &["f"], None).await;
+        mirror(&pool, low, &["a", "x", "y", "z"], &[]).await;
+        let lowest = profile(&pool, "m", &["f"], None).await;
+        mirror(&pool, lowest, &["w", "x", "y", "z"], &[]).await;
+        for id in [me, best, mid, low, lowest] {
+            entry(&pool, id, "life", "x").await;
+        }
+        judged(&pool, me, best, Grade::Poor).await;
+        judged(&pool, me, low, Grade::Strong).await;
+        judged(&pool, me, lowest, Grade::Unclear).await;
+
+        let body = get_with(
+            crate::state::test_state_with_llm(pool.clone()),
+            &format!("/v1/match/candidates/{me}"),
+        )
+        .await;
+        let c = body["candidates"].as_array().unwrap();
+        let order: Vec<String> = c
+            .iter()
+            .map(|x| x["user_id"].as_str().unwrap().to_string())
+            .collect();
+        // strong, then unjudged (mid) and unclear (lowest) by score, poor last.
+        assert_eq!(
+            order,
+            [low, mid, lowest, best]
+                .iter()
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(c[0]["chemistry"], "strong");
+        assert!(c[1]["chemistry"].is_null());
+        assert_eq!(c[3]["chemistry"], "poor");
+        assert!(!body.to_string().contains("rationale"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn without_a_model_stored_grades_are_not_served(pool: PgPool) {
+        use crate::db::autobio::tests::entry;
+        use crate::db::verdicts::Grade;
+        let me = profile(&pool, "f", &["m"], None).await;
+        mirror(&pool, me, &["a", "b", "c", "d"], &[]).await;
+        let best = profile(&pool, "m", &["f"], None).await;
+        mirror(&pool, best, &["a", "b", "c", "d"], &[]).await;
+        let mid = profile(&pool, "m", &["f"], None).await;
+        mirror(&pool, mid, &["a", "b", "x", "y"], &[]).await;
+        let low = profile(&pool, "m", &["f"], None).await;
+        mirror(&pool, low, &["a", "x", "y", "z"], &[]).await;
+        for id in [me, best, mid, low] {
+            entry(&pool, id, "life", "x").await;
+        }
+        // A stored grade from a time a model was configured: it must not show.
+        judged(&pool, me, low, Grade::Strong).await;
+
+        let body = get_with(
+            test_state(pool.clone()),
+            &format!("/v1/match/candidates/{me}"),
+        )
+        .await;
+        let c = body["candidates"].as_array().unwrap();
+        let order: Vec<String> = c
+            .iter()
+            .map(|x| x["user_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            order,
+            [best, mid, low]
+                .iter()
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>(),
+            "plain score order"
+        );
+        assert!(c.iter().all(|x| x["chemistry"].is_null()));
+        assert!(queued(&pool).await.is_empty(), "no model: nothing queued");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn with_a_model_the_top_k_pairs_without_a_fresh_verdict_are_queued(pool: PgPool) {
+        use crate::db::autobio::tests::entry;
+        use crate::db::verdicts::{pair, Grade};
+        let me = profile(&pool, "f", &["m"], None).await;
+        mirror(&pool, me, &["jazz"], &[]).await;
+        entry(&pool, me, "life", "x").await;
+        // Fourteen tied candidates: the heuristic order is ascending id.
+        let mut ids: Vec<Uuid> = (0..14).map(|_| Uuid::new_v4()).collect();
+        ids.sort();
+        for id in &ids {
+            profile_as(&pool, *id, "m", &["f"], None, true).await;
+            mirror(&pool, *id, &["jazz"], &[]).await;
+        }
+        // Positions 0..10 are the top K. 0 has no autobio, 1 is fresh,
+        // 2 is stale; 3..10 are plain eligible pairs; 10..14 sit past K.
+        for id in &ids[1..] {
+            entry(&pool, *id, "life", "y").await;
+        }
+        judged(&pool, me, ids[1], Grade::Promising).await;
+        judged(&pool, me, ids[2], Grade::Promising).await;
+        entry(&pool, ids[2], "life", "changed since").await;
+
+        let state = crate::state::test_state_with_llm(pool.clone());
+        let body = get_with(state, &format!("/v1/match/candidates/{me}?limit=20")).await;
+        assert_eq!(body["candidates"].as_array().unwrap().len(), 14);
+        let stale_row = body["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["user_id"] == ids[2].to_string())
+            .unwrap();
+        assert_eq!(
+            stale_row["chemistry"], "promising",
+            "a stale grade is still shown"
+        );
+
+        // Exactly the top K minus the ineligible: 2..10, stale included.
+        let mut q: Vec<(Uuid, Uuid)> = queued(&pool).await;
+        q.sort();
+        let mut expected: Vec<(Uuid, Uuid)> = ids[2..10].iter().map(|id| pair(me, *id)).collect();
+        expected.sort();
+        assert_eq!(q, expected);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn without_my_own_autobio_nothing_is_queued(pool: PgPool) {
+        use crate::db::autobio::tests::entry;
+        let me = profile(&pool, "f", &["m"], None).await;
+        mirror(&pool, me, &["jazz"], &[]).await;
+        let him = profile(&pool, "m", &["f"], None).await;
+        mirror(&pool, him, &["jazz"], &[]).await;
+        entry(&pool, him, "life", "y").await;
+        get_with(
+            crate::state::test_state_with_llm(pool.clone()),
+            &format!("/v1/match/candidates/{me}"),
+        )
+        .await;
+        assert!(queued(&pool).await.is_empty());
     }
 }

@@ -3,11 +3,13 @@
 //! Subcommands: `serve` (default) · `migrate` · `print-openapi`.
 
 mod auth;
+mod autobio;
 mod concepts;
 mod config;
 mod db;
 mod engine_client;
 mod error;
+mod judge;
 mod llm;
 mod openapi;
 mod routes;
@@ -16,6 +18,9 @@ mod state;
 mod sweeper;
 
 use std::sync::Arc;
+
+/// Autobio and judge replies can be long; the concept step keeps the 60 s default.
+const LONG_CALL: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[tokio::main]
 async fn main() {
@@ -71,6 +76,7 @@ async fn run_serve() -> Result<(), Box<dyn std::error::Error>> {
     let config = config::Config::from_env()?;
     let weights = config::Weights::load(&config.weights_path)?;
     let label_language = config::load_label_language(&config.weights_path)?;
+    let autobio_language = config::load_autobio_language(&config.weights_path)?;
     let pool = db::connect(&config.database_url).await?;
     let bind_addr = config.bind_addr.clone();
     let state = state::AppState {
@@ -83,20 +89,51 @@ async fn run_serve() -> Result<(), Box<dyn std::error::Error>> {
         label_language,
         max_per_tick: state.config.concept_max_per_tick,
     });
+    // A per-tick cap of 0 turns that step off.
+    let autobio_task = state
+        .config
+        .llm
+        .as_ref()
+        .filter(|_| state.config.autobio_max_per_tick > 0)
+        .map(|llm| autobio::AutobioTask {
+            client: llm::LlmClient::with_timeout(
+                &llm.with_model(state.config.autobio_model.as_deref()),
+                LONG_CALL,
+            ),
+            language: autobio_language.clone(),
+            max_per_tick: state.config.autobio_max_per_tick,
+            min_interval: chrono::Duration::from_std(state.config.autobio_min_interval)
+                .expect("interval fits"),
+        });
+    let judge_task = state
+        .config
+        .llm
+        .as_ref()
+        .filter(|_| state.config.judge_max_per_tick > 0)
+        .map(|llm| judge::JudgeTask {
+            client: llm::LlmClient::with_timeout(
+                &llm.with_model(state.config.judge_model.as_deref()),
+                LONG_CALL,
+            ),
+            language: autobio_language,
+            max_per_tick: state.config.judge_max_per_tick,
+        });
     match (&state.config.engine, state.config.sweep_interval) {
         (Some(engine), interval) if interval > std::time::Duration::ZERO => {
             let client = engine_client::EngineClient::new(engine);
-            let concepts_on = concept_task.is_some();
+            let models_on = concept_task.is_some();
             tokio::spawn(sweeper::run_loop(
                 state.pool.clone(),
                 client,
                 concept_task,
+                autobio_task,
+                judge_task,
                 interval,
             ));
-            tracing::info!(every_secs = interval.as_secs(), engine = %engine.base_url, concepts = concepts_on, "mirror sweeper on");
+            tracing::info!(every_secs = interval.as_secs(), engine = %engine.base_url, models = models_on, "mirror sweeper on");
         }
         _ => tracing::info!(
-            "mirror sweeper off (no ENGINE_* config or SWEEP_DISABLED); the concept step runs only with it"
+            "mirror sweeper off (no ENGINE_* config or SWEEP_DISABLED); the model steps run only with it"
         ),
     }
     let app = routes::build_app(state);
