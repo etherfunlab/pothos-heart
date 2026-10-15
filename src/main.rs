@@ -7,6 +7,8 @@ mod config;
 mod db;
 mod engine_client;
 mod error;
+#[allow(dead_code)] // wired in Task 4
+mod llm;
 mod openapi;
 mod routes;
 mod scoring;

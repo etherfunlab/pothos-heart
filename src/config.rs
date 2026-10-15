@@ -24,6 +24,25 @@ impl std::fmt::Debug for EngineConfig {
     }
 }
 
+/// An OpenAI-compatible chat-completions endpoint for the concept step.
+#[allow(dead_code)] // wired in Task 4
+#[derive(Clone)]
+pub struct LlmConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
+impl std::fmt::Debug for LlmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"<redacted>")
+            .field("model", &self.model)
+            .finish()
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub database_url: String,
@@ -331,5 +350,19 @@ mod tests {
              [geo]\ncity = 1.0\nregion = 1.0\ncountry = 1.0\n"
         )
         .is_ok());
+    }
+    #[test]
+    fn llm_config_debug_redacts_the_key() {
+        let c = LlmConfig {
+            base_url: "http://llm".into(),
+            api_key: "sk-very-secret".into(),
+            model: "m".into(),
+        };
+        let shown = format!("{c:?}");
+        assert!(!shown.contains("sk-very-secret"), "{shown}");
+        assert!(
+            shown.contains("http://llm") && shown.contains("\"m\""),
+            "{shown}"
+        );
     }
 }
