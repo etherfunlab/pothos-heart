@@ -6,6 +6,8 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
 pub mod candidates;
+#[allow(dead_code)] // wired in Task 4
+pub mod concepts;
 pub mod mirror;
 pub mod profiles;
 

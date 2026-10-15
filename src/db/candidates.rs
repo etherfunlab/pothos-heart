@@ -106,6 +106,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::{concept_sets, hard_filtered};
+    use crate::db::concepts::{self, Decision};
     use crate::db::mirror::{self, MirrorRow};
     use crate::db::profiles::{self, ProfileWrite};
 
@@ -392,5 +393,68 @@ mod tests {
         let s = concept_sets(&pool, Uuid::new_v4()).await.unwrap();
         assert!(s.interests.is_empty());
         assert!(s.personality_traits.is_empty());
+    }
+    fn decision(dimension: &str, phrase: &str, concepts: &[&str]) -> Decision {
+        Decision {
+            dimension: dimension.into(),
+            phrase: phrase.into(),
+            concepts: concepts.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn deal_breakers_and_shared_interests_work_on_concepts(pool: PgPool) {
+        let me = profile(&pool, "f", &["m"], None, true).await;
+        mirror_at(
+            &pool,
+            me,
+            t0(),
+            &["listens to old jazz"],
+            &[],
+            &["can't stand smoking"],
+        )
+        .await;
+        let chain = profile(&pool, "m", &["f"], None, true).await;
+        mirror_at(&pool, chain, t0(), &[], &["chain smoker"], &[]).await;
+        let quit = profile(&pool, "m", &["f"], None, true).await;
+        mirror_at(
+            &pool,
+            quit,
+            t0(),
+            &["weekend jazz bars"],
+            &["quit smoking three years ago"],
+            &[],
+        )
+        .await;
+        concepts::record(
+            &pool,
+            "m",
+            &[
+                decision("interests", "listens to old jazz", &["jazz"]),
+                decision("interests", "weekend jazz bars", &["jazz", "bars"]),
+                decision("deal_breakers", "can't stand smoking", &["smoking"]),
+                decision("personality_traits", "chain smoker", &["smoking"]),
+                decision(
+                    "personality_traits",
+                    "quit smoking three years ago",
+                    &["quitting smoking"],
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let rows = hard_filtered(&pool, me).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.user_id).collect::<Vec<_>>(),
+            vec![quit]
+        );
+        assert!(!rows.iter().any(|r| r.user_id == chain));
+        assert_eq!(rows[0].interests, vec!["bars", "jazz"]);
+        assert_eq!(rows[0].personality_traits, vec!["quitting smoking"]);
+        assert_eq!(
+            concept_sets(&pool, me).await.unwrap().interests,
+            vec!["jazz"]
+        );
     }
 }
