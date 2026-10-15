@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::concepts::ConceptTask;
 use crate::db::mirror::{self, MirrorRow};
 use crate::engine_client::{EngineClient, EngineError, ExportRow};
 
@@ -74,9 +75,15 @@ pub async fn run_once(pool: &PgPool, client: &EngineClient) -> Result<usize, Swe
     Ok(total)
 }
 
-/// Sweep forever at `interval`. Errors are logged; the next tick retries from
-/// wherever the cursor stopped.
-pub async fn run_loop(pool: PgPool, client: EngineClient, interval: Duration) {
+/// Sweep forever at `interval`: mirror the export, then — when a model is
+/// configured — decide undecided phrases, whatever the mirror step did.
+/// Errors are logged; the next tick retries from wherever each step stopped.
+pub async fn run_loop(
+    pool: PgPool,
+    client: EngineClient,
+    concepts: Option<ConceptTask>,
+    interval: Duration,
+) {
     loop {
         match run_once(&pool, &client).await {
             Ok(n) if n > 0 => tracing::info!(rows = n, "mirror sweep"),
@@ -85,6 +92,20 @@ pub async fn run_loop(pool: PgPool, client: EngineClient, interval: Duration) {
             // can tell a refused connection from DNS or TLS.
             Err(e) => {
                 tracing::warn!(error = ?e, "mirror sweep failed; cursor kept at last landed page")
+            }
+        }
+        if let Some(task) = &concepts {
+            match crate::concepts::run_once(&pool, task).await {
+                Ok(r) if r.decided + r.skipped > 0 => tracing::info!(
+                    decided = r.decided,
+                    skipped = r.skipped,
+                    new_concepts = r.new_concepts,
+                    vocabulary = r.vocabulary,
+                    tokens = r.tokens,
+                    "concept step"
+                ),
+                Ok(_) => tracing::debug!("concept step: nothing undecided"),
+                Err(e) => tracing::warn!(error = ?e, "concept step failed; phrases stay undecided"),
             }
         }
         tokio::time::sleep(interval).await;

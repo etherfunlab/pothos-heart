@@ -12,3 +12,8 @@ geo = 0.2
 city = 1.0
 region = 0.6
 country = 0.3
+
+# Concept step: the language new concept labels are written in. Existing
+# labels are reused whatever language a phrase is in.
+[concepts]
+label_language = "en"
