@@ -56,6 +56,19 @@ pub(crate) fn canon(s: &str) -> Option<String> {
     (!c.is_empty()).then_some(c)
 }
 
+/// Canonical labels (`canon`), repeats dropped, first occurrence wins. The SQL
+/// hard filter compares stored phrases with exact `&&`, so everything stored
+/// takes this form.
+pub(crate) fn canonical(values: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(values.len());
+    for c in values.iter().filter_map(|v| canon(v)) {
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn as_set(items: &[String]) -> BTreeSet<String> {
     items.iter().filter_map(|s| canon(s)).collect()
 }

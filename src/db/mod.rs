@@ -41,10 +41,12 @@ pub async fn migrate(url: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{DateTime, TimeZone, Utc};
     use sqlx::PgPool;
+    use uuid::Uuid;
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn init_creates_the_three_tables_with_gin_indexes_and_one_cursor_row(pool: PgPool) {
+    async fn schema_has_the_ledger_the_vocabulary_and_two_cascading_fks(pool: PgPool) {
         let tables: Vec<String> = sqlx::query_scalar(
             "SELECT tablename FROM pg_tables WHERE schemaname = 'pothos' ORDER BY tablename",
         )
@@ -53,8 +55,24 @@ mod tests {
         .unwrap();
         assert_eq!(
             tables,
-            vec!["insight_mirror", "match_profiles", "sync_cursor"]
+            vec![
+                "concepts",
+                "insight_mirror",
+                "match_profiles",
+                "observed_phrases",
+                "phrase_concepts",
+                "phrase_decisions",
+                "sync_cursor"
+            ]
         );
+
+        let views: Vec<String> = sqlx::query_scalar(
+            "SELECT viewname FROM pg_views WHERE schemaname = 'pothos' ORDER BY viewname",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(views, vec!["user_concepts"]);
 
         let gin: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_indexes WHERE schemaname = 'pothos' \
@@ -63,21 +81,117 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(gin, 2, "GIN on interests and personality_traits");
+        assert_eq!(gin, 0, "the arrays and their GIN indexes left the mirror");
 
-        let fks: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace \
-             WHERE n.nspname = 'pothos' AND c.contype = 'f'",
+        // (child, parent, on delete, on update)
+        let fks: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT c.conrelid::regclass::text, c.confrelid::regclass::text, \
+                    c.confdeltype::text, c.confupdtype::text \
+             FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace \
+             WHERE n.nspname = 'pothos' AND c.contype = 'f' ORDER BY 2",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let fk = |p: &str, d: &str, u: &str| {
+            (
+                "pothos.phrase_concepts".to_string(),
+                p.to_string(),
+                d.to_string(),
+                u.to_string(),
+            )
+        };
+        assert_eq!(
+            fks,
+            vec![
+                fk("pothos.concepts", "c", "c"),
+                fk("pothos.phrase_decisions", "c", "a")
+            ]
+        );
+
+        let concept_fk_index: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_indexes WHERE schemaname = 'pothos' \
+               AND indexname = 'idx_phrase_concepts_concept'",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(fks, 0, "spec §3.2: zero foreign keys by design");
+        assert_eq!(concept_fk_index, 1);
 
         let cursor_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM pothos.sync_cursor")
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(cursor_rows, 1);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn migration_0002_moves_mirror_arrays_into_the_ledger(pool: PgPool) {
+        sqlx::raw_sql(include_str!("../../migrations/0001_init.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let a = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO pothos.insight_mirror \
+                (user_id, interests, personality_traits, deal_breakers, age_min, engine_updated_at) \
+             VALUES ($1, '{jazz,tea}', '{calm}', '{smoking}', 25, '2026-10-13T12:00:00Z')",
+        )
+        .bind(a)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0002_phrase_ledger_and_concepts.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let t: DateTime<Utc> = Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap();
+        let rows: Vec<(String, String, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT dimension, phrase, first_seen_at, last_seen_at \
+             FROM pothos.observed_phrases WHERE user_id = $1 ORDER BY dimension, phrase",
+        )
+        .bind(a)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let r = |d: &str, p: &str| (d.to_string(), p.to_string(), t, t);
+        assert_eq!(
+            rows,
+            vec![
+                r("deal_breakers", "smoking"),
+                r("interests", "jazz"),
+                r("interests", "tea"),
+                r("personality_traits", "calm")
+            ]
+        );
+
+        let cols: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name::text FROM information_schema.columns \
+             WHERE table_schema = 'pothos' AND table_name = 'insight_mirror' ORDER BY column_name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            cols,
+            vec![
+                "age_max",
+                "age_min",
+                "engine_updated_at",
+                "synced_at",
+                "user_id"
+            ]
+        );
+        let age: Option<i32> =
+            sqlx::query_scalar("SELECT age_min FROM pothos.insight_mirror WHERE user_id = $1")
+                .bind(a)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(age, Some(25), "scalars survive the migration");
     }
 }
