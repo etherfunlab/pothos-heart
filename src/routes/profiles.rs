@@ -35,6 +35,10 @@ pub struct ProfileBody {
     pub country: Option<String>,
     pub region: Option<String>,
     pub city: Option<String>,
+    /// The user's own age window for candidates, self-filled on the product
+    /// layer. Either side may stand alone; absent means no preference.
+    pub age_min: Option<i32>,
+    pub age_max: Option<i32>,
     /// `false` keeps the row but takes the user out of the pool.
     #[serde(default = "default_true")]
     pub active: bool,
@@ -66,6 +70,23 @@ fn validate(b: ProfileBody) -> Result<ProfileWrite, AppError> {
             ));
         }
     }
+    // Self-filled via the product layer: bad data is refused, not dropped.
+    for (name, value) in [("age_min", b.age_min), ("age_max", b.age_max)] {
+        if let Some(a) = value {
+            if !(1..=130).contains(&a) {
+                return Err(AppError::BadRequest(format!(
+                    "{name} must be between 1 and 130"
+                )));
+            }
+        }
+    }
+    if let (Some(min), Some(max)) = (b.age_min, b.age_max) {
+        if min > max {
+            return Err(AppError::BadRequest(
+                "age_min must not exceed age_max".into(),
+            ));
+        }
+    }
     let trim = |s: Option<String>| s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     Ok(ProfileWrite {
         gender: label(&b.gender),
@@ -74,6 +95,8 @@ fn validate(b: ProfileBody) -> Result<ProfileWrite, AppError> {
         country: trim(b.country),
         region: trim(b.region),
         city: trim(b.city),
+        age_min: b.age_min,
+        age_max: b.age_max,
         active: b.active,
     })
 }
@@ -249,6 +272,101 @@ mod tests {
         assert!(second.updated_at > first.updated_at);
     }
 
+    async fn stored_ages(pool: &sqlx::PgPool, id: Uuid) -> (Option<i32>, Option<i32>) {
+        sqlx::query_as("SELECT age_min, age_max FROM pothos.match_profiles WHERE user_id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn put_stores_age_window_and_omitting_it_clears(pool: sqlx::PgPool) {
+        let id = Uuid::new_v4();
+        let mut body = valid();
+        body["age_min"] = serde_json::json!(25);
+        body["age_max"] = serde_json::json!(40);
+        let (status, _) = send(
+            pool.clone(),
+            "PUT",
+            &format!("/v1/profiles/{id}"),
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(stored_ages(&pool, id).await, (Some(25), Some(40)));
+
+        // PUT replaces the whole row: a body without the window clears it.
+        let (status, _) = send(
+            pool.clone(),
+            "PUT",
+            &format!("/v1/profiles/{id}"),
+            Some(valid()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(stored_ages(&pool, id).await, (None, None));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn age_window_is_validated(pool: sqlx::PgPool) {
+        let id = Uuid::new_v4();
+        for (field, value, needle) in [
+            ("age_min", 0, "between 1 and 130"),
+            ("age_max", 131, "between 1 and 130"),
+            ("age_min", 200, "between 1 and 130"),
+        ] {
+            let mut body = valid();
+            body[field] = serde_json::json!(value);
+            let (status, json) = send(
+                pool.clone(),
+                "PUT",
+                &format!("/v1/profiles/{id}"),
+                Some(body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}={value}");
+            let message = json["message"].as_str().unwrap();
+            assert!(message.contains(field) && message.contains(needle), "{message}");
+        }
+
+        let mut inverted = valid();
+        inverted["age_min"] = serde_json::json!(40);
+        inverted["age_max"] = serde_json::json!(25);
+        let (status, json) = send(
+            pool.clone(),
+            "PUT",
+            &format!("/v1/profiles/{id}"),
+            Some(inverted),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(json["message"]
+            .as_str()
+            .unwrap()
+            .contains("age_min must not exceed age_max"));
+
+        // One-sided and equal bounds are fine.
+        for (min, max) in [(Some(18), None), (None, Some(60)), (Some(30), Some(30))] {
+            let mut body = valid();
+            if let Some(v) = min {
+                body["age_min"] = serde_json::json!(v);
+            }
+            if let Some(v) = max {
+                body["age_max"] = serde_json::json!(v);
+            }
+            let (status, _) = send(
+                pool.clone(),
+                "PUT",
+                &format!("/v1/profiles/{id}"),
+                Some(body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "({min:?}, {max:?})");
+            assert_eq!(stored_ages(&pool, id).await, (min, max));
+        }
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn put_accepts_a_birth_date_of_today(pool: sqlx::PgPool) {
         let id = Uuid::new_v4();
@@ -396,7 +514,7 @@ mod tests {
             .await;
             entry(&pool, id, "life", "x").await;
         }
-        export(&pool, a, at(0), &[("city", "Singapore")]).await;
+        export(&pool, a, at(0), &["jazz"]).await;
         sqlx::query(
             "INSERT INTO pothos.autobio_state (user_id, material_until, ran_at, model) VALUES ($1, now(), now(), 'm')",
         )

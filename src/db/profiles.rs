@@ -15,6 +15,8 @@ pub struct MatchProfile {
     pub country: Option<String>,
     pub region: Option<String>,
     pub city: Option<String>,
+    pub age_min: Option<i32>,
+    pub age_max: Option<i32>,
     pub active: bool,
     pub updated_at: DateTime<Utc>,
 }
@@ -27,6 +29,8 @@ pub struct ProfileWrite {
     pub country: Option<String>,
     pub region: Option<String>,
     pub city: Option<String>,
+    pub age_min: Option<i32>,
+    pub age_max: Option<i32>,
     pub active: bool,
 }
 
@@ -34,13 +38,14 @@ pub struct ProfileWrite {
 pub async fn upsert(pool: &PgPool, user_id: Uuid, w: &ProfileWrite) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO pothos.match_profiles \
-            (user_id, gender, seeking_genders, birth_date, country, region, city, active, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now()) \
+            (user_id, gender, seeking_genders, birth_date, country, region, city, age_min, age_max, active, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now()) \
          ON CONFLICT (user_id) DO UPDATE SET \
             gender = EXCLUDED.gender, seeking_genders = EXCLUDED.seeking_genders, \
             birth_date = EXCLUDED.birth_date, country = EXCLUDED.country, \
-            region = EXCLUDED.region, city = EXCLUDED.city, active = EXCLUDED.active, \
-            updated_at = now()",
+            region = EXCLUDED.region, city = EXCLUDED.city, \
+            age_min = EXCLUDED.age_min, age_max = EXCLUDED.age_max, \
+            active = EXCLUDED.active, updated_at = now()",
     )
     .bind(user_id)
     .bind(&w.gender)
@@ -49,6 +54,8 @@ pub async fn upsert(pool: &PgPool, user_id: Uuid, w: &ProfileWrite) -> sqlx::Res
     .bind(&w.country)
     .bind(&w.region)
     .bind(&w.city)
+    .bind(w.age_min)
+    .bind(w.age_max)
     .bind(w.active)
     .execute(pool)
     .await?;
@@ -80,7 +87,7 @@ pub async fn delete(pool: &PgPool, user_id: Uuid) -> sqlx::Result<bool> {
 
 pub async fn load(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Option<MatchProfile>> {
     sqlx::query_as::<_, MatchProfile>(
-        "SELECT user_id, gender, seeking_genders, birth_date, country, region, city, active, updated_at \
+        "SELECT user_id, gender, seeking_genders, birth_date, country, region, city, age_min, age_max, active, updated_at \
          FROM pothos.match_profiles WHERE user_id = $1",
     )
     .bind(user_id)

@@ -8,6 +8,8 @@ use sqlx::PgPool;
 pub mod autobio;
 pub mod candidates;
 pub mod concepts;
+pub mod erasures;
+pub mod facts;
 pub mod memories;
 pub mod mirror;
 pub mod profiles;
@@ -50,7 +52,7 @@ mod tests {
     use uuid::Uuid;
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn schema_has_the_v03_tables_views_and_foreign_keys(pool: PgPool) {
+    async fn schema_has_the_v04_tables_views_and_foreign_keys(pool: PgPool) {
         let tables: Vec<String> = sqlx::query_scalar(
             "SELECT tablename FROM pg_tables WHERE schemaname = 'pothos' ORDER BY tablename",
         )
@@ -61,10 +63,14 @@ mod tests {
             tables,
             vec![
                 "autobio_entries",
+                "autobio_fact_sources",
                 "autobio_memory_sources",
                 "autobio_observed_sources",
                 "autobio_state",
                 "concepts",
+                "erasure_cursor",
+                "fact_cursor",
+                "fact_mirror",
                 "insight_mirror",
                 "judge_queue",
                 "match_profiles",
@@ -108,6 +114,8 @@ mod tests {
             fks,
             vec![
                 fk("autobio_entries", "autobio_entries", "n", "a"),
+                fk("autobio_fact_sources", "autobio_entries", "c", "a"),
+                fk("autobio_fact_sources", "fact_mirror", "c", "a"),
                 fk("autobio_memory_sources", "autobio_entries", "c", "a"),
                 fk("autobio_memory_sources", "memory_mirror", "c", "a"),
                 fk("autobio_observed_sources", "autobio_entries", "c", "a"),
@@ -120,6 +128,7 @@ mod tests {
         // Every FK column is indexed (alone or as an index's first column).
         for (table, column) in [
             ("autobio_entries", "supersedes"),
+            ("autobio_fact_sources", "fact_id"),
             ("autobio_memory_sources", "memory_id"),
             ("autobio_observed_sources", "observed_id"),
             ("phrase_concepts", "concept"),
@@ -214,6 +223,115 @@ mod tests {
             rejected.is_err(),
             "preferred_gender is not a ledger dimension"
         );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn migration_0004_moves_the_age_window_and_keeps_v03_data(pool: PgPool) {
+        for sql in [
+            include_str!("../../migrations/0001_init.sql"),
+            include_str!("../../migrations/0002_phrase_ledger_and_concepts.sql"),
+            include_str!("../../migrations/0003_autobio_and_judge.sql"),
+        ] {
+            sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+        }
+        let a = Uuid::new_v4();
+        let t: DateTime<Utc> = Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap();
+        // 0003-era data: an insights row with an LLM-guessed age window, a
+        // ledger row, an entry citing it, and a profile.
+        sqlx::query(
+            "INSERT INTO pothos.insight_mirror (user_id, age_min, age_max, engine_updated_at) \
+             VALUES ($1, 25, 35, $2)",
+        )
+        .bind(a)
+        .bind(t)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO pothos.observed_phrases (user_id, dimension, phrase, first_seen_at, last_seen_at) \
+             VALUES ($1, 'love_values', 'slow to warm up', $2, $2)",
+        )
+        .bind(a)
+        .bind(t)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let o: i64 =
+            sqlx::query_scalar("SELECT id FROM pothos.observed_phrases WHERE user_id = $1")
+                .bind(a)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let e: i64 = sqlx::query_scalar(
+            "INSERT INTO pothos.autobio_entries (user_id, section, status, statement) \
+             VALUES ($1, 'love', 'current', 'Slow to warm up') RETURNING id",
+        )
+        .bind(a)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO pothos.autobio_observed_sources VALUES ($1, $2)")
+            .bind(e)
+            .bind(o)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO pothos.match_profiles (user_id, gender, seeking_genders) \
+             VALUES ($1, 'f', '{m}')",
+        )
+        .bind(a)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(include_str!("../../migrations/0004_facts_erasures_age.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The age window moved home: the columns are gone here …
+        let cols: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name::text FROM information_schema.columns \
+             WHERE table_schema = 'pothos' AND table_name = 'insight_mirror' ORDER BY column_name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cols, vec!["engine_updated_at", "synced_at", "user_id"]);
+        // … and nullable on the populated profile there.
+        let ages: (Option<i32>, Option<i32>) =
+            sqlx::query_as("SELECT age_min, age_max FROM pothos.match_profiles WHERE user_id = $1")
+                .bind(a)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(ages, (None, None));
+
+        // 0003-era rows survive untouched.
+        let seen: DateTime<Utc> =
+            sqlx::query_scalar("SELECT engine_updated_at FROM pothos.insight_mirror WHERE user_id = $1")
+                .bind(a)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(seen, t);
+        let phrase: String =
+            sqlx::query_scalar("SELECT phrase FROM pothos.observed_phrases WHERE id = $1")
+                .bind(o)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(phrase, "slow to warm up");
+        let linked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pothos.autobio_observed_sources WHERE entry_id = $1 AND observed_id = $2",
+        )
+        .bind(e)
+        .bind(o)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(linked, 1, "the entry keeps its o: source");
     }
 
     #[sqlx::test(migrations = false)]

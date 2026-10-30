@@ -1,9 +1,10 @@
-//! The engine export as this service stores it: the scalars in
-//! `pothos.insight_mirror`, every array item and every version of a text
-//! column ever exported in `pothos.observed_phrases`. A ledger row is current
-//! when its `last_seen_at` equals the mirror row's `engine_updated_at`.
-//! Nothing here is deleted: a value the engine stops exporting stays, its
-//! `last_seen_at` frozen.
+//! The engine export as this service stores it: the arrival stamp in
+//! `pothos.insight_mirror`, every array phrase ever exported in
+//! `pothos.observed_phrases`. A ledger row is current when its `last_seen_at`
+//! equals the mirror row's `engine_updated_at`. Nothing here is deleted by an
+//! export: a phrase the engine stops exporting stays, its `last_seen_at`
+//! frozen. The export's text columns are derived summaries of the fact ledger
+//! and are not read; autobio takes the facts themselves.
 
 use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
@@ -12,43 +13,31 @@ use uuid::Uuid;
 use crate::engine_client::Cursor;
 use crate::scoring;
 
-/// The engine's text columns kept in the ledger, one row per version.
-/// `preferred_gender` is not among them: the product layer's
-/// `seeking_genders` is the authority on gender.
-pub const TEXT_FIELDS: [&str; 15] = [
-    "city",
-    "location",
-    "hometown",
-    "nationality",
-    "occupation",
-    "mbti_guess",
-    "love_values",
-    "emotional_needs",
-    "life_rhythm",
-    "education",
-    "family",
-    "relationship_history",
-    "social_pattern",
-    "future_plans",
-    "finance_status",
-];
-
-/// Longest text value kept in the ledger, in bytes. It keeps a ledger row under
+/// Longest phrase kept in the ledger, in bytes. It keeps a ledger row under
 /// Postgres's btree entry limit and guards abnormal output; it is not a quality rule.
 pub const MAX_TEXT_BYTES: usize = 2000;
 
+/// `v` cut to at most `MAX_TEXT_BYTES`, on a char boundary.
+fn cap(v: String) -> String {
+    if v.len() <= MAX_TEXT_BYTES {
+        return v;
+    }
+    let mut end = MAX_TEXT_BYTES;
+    while !v.is_char_boundary(end) {
+        end -= 1;
+    }
+    tracing::warn!("array phrase cut to the ledger cap");
+    v[..end].to_string()
+}
+
 /// One exported profile as the sweeper hands it over. Arrays may be raw; they
-/// are canonicalised on write.
+/// are canonicalised and capped on write.
 #[derive(Debug, Clone)]
 pub struct MirrorRow {
     pub user_id: Uuid,
     pub interests: Vec<String>,
     pub personality_traits: Vec<String>,
     pub deal_breakers: Vec<String>,
-    /// (text field, value): trimmed, case kept, blanks already dropped.
-    pub texts: Vec<(String, String)>,
-    pub age_min: Option<i32>,
-    pub age_max: Option<i32>,
     pub engine_updated_at: DateTime<Utc>,
 }
 
@@ -64,19 +53,25 @@ pub async fn exists(pool: &PgPool, user_id: Uuid) -> sqlx::Result<bool> {
 /// `apply_page` both run it inside their transaction.
 async fn upsert_row(conn: &mut PgConnection, row: &MirrorRow) -> sqlx::Result<()> {
     sqlx::query(
-        "INSERT INTO pothos.insight_mirror (user_id, age_min, age_max, engine_updated_at, synced_at) \
-         VALUES ($1, $2, $3, $4, now()) \
+        "INSERT INTO pothos.insight_mirror (user_id, engine_updated_at, synced_at) \
+         VALUES ($1, $2, now()) \
          ON CONFLICT (user_id) DO UPDATE SET \
-            age_min = EXCLUDED.age_min, age_max = EXCLUDED.age_max, \
             engine_updated_at = EXCLUDED.engine_updated_at, synced_at = now()",
     )
     .bind(row.user_id)
-    .bind(row.age_min)
-    .bind(row.age_max)
     .bind(row.engine_updated_at)
     .execute(&mut *conn)
     .await?;
     // A new phrase starts and ends at this export; a known one moves its end.
+    // Capped after canonicalisation (lowercasing can change byte length), then
+    // deduplicated again: two phrases may collide once cut, and one INSERT
+    // must not hit the same ledger row twice.
+    let phrases = |v: &[String]| -> Vec<String> {
+        let mut v: Vec<String> = scoring::canonical(v).into_iter().map(cap).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
     sqlx::query(
         "INSERT INTO pothos.observed_phrases (user_id, dimension, phrase, first_seen_at, last_seen_at) \
          SELECT $1, d.dimension, d.phrase, $5, $5 FROM ( \
@@ -87,24 +82,9 @@ async fn upsert_row(conn: &mut PgConnection, row: &MirrorRow) -> sqlx::Result<()
          ON CONFLICT (user_id, dimension, phrase) DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at",
     )
     .bind(row.user_id)
-    .bind(scoring::canonical(&row.interests))
-    .bind(scoring::canonical(&row.personality_traits))
-    .bind(scoring::canonical(&row.deal_breakers))
-    .bind(row.engine_updated_at)
-    .execute(&mut *conn)
-    .await?;
-    // Text columns: a new version starts and ends at this export; a known
-    // one moves its end. Stored as given (trimmed), not canonicalised.
-    let (fields, values): (Vec<String>, Vec<String>) = row.texts.iter().cloned().unzip();
-    sqlx::query(
-        "INSERT INTO pothos.observed_phrases (user_id, dimension, phrase, first_seen_at, last_seen_at) \
-         SELECT $1, t.dimension, t.phrase, $4, $4 \
-         FROM unnest($2::text[], $3::text[]) AS t(dimension, phrase) \
-         ON CONFLICT (user_id, dimension, phrase) DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at",
-    )
-    .bind(row.user_id)
-    .bind(&fields)
-    .bind(&values)
+    .bind(phrases(&row.interests))
+    .bind(phrases(&row.personality_traits))
+    .bind(phrases(&row.deal_breakers))
     .bind(row.engine_updated_at)
     .execute(&mut *conn)
     .await?;
@@ -208,9 +188,6 @@ mod tests {
             interests: interests.iter().map(|s| s.to_string()).collect(),
             personality_traits: vec![],
             deal_breakers: vec![],
-            age_min: None,
-            age_max: None,
-            texts: vec![],
             engine_updated_at: t,
         }
     }
@@ -222,6 +199,21 @@ mod tests {
             first_seen_at: first,
             last_seen_at: last,
         }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_over_long_array_phrase_is_cut_to_the_cap(pool: PgPool) {
+        let a = Uuid::new_v4();
+        let long = "爵".repeat(1400); // 4200 bytes, over the btree entry limit
+        upsert_one(&pool, &row(a, at(0), &[&long, "jazz"]))
+            .await
+            .unwrap();
+        let rows = observed(&pool, a).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let cut = &rows.iter().find(|o| o.phrase != "jazz").unwrap().phrase;
+        assert!(long.starts_with(cut.as_str()));
+        assert!(cut.len() <= MAX_TEXT_BYTES);
+        assert_eq!(cut.chars().count(), 666, "cut on a char boundary");
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -286,51 +278,4 @@ mod tests {
         assert!(observed(&pool, a).await.unwrap().is_empty());
     }
 
-    #[sqlx::test(migrations = "./migrations")]
-    async fn text_columns_are_kept_per_version_trimmed_and_case_kept(pool: PgPool) {
-        let a = Uuid::new_v4();
-        let mut r = row(a, at(0), &[]);
-        r.texts = vec![
-            ("love_values".into(), "Wants to be understood".into()),
-            ("city".into(), "Singapore".into()),
-        ];
-        upsert_one(&pool, &r).await.unwrap();
-        let first: DateTime<Utc> = sqlx::query_scalar(
-            "SELECT recorded_at FROM pothos.observed_phrases WHERE user_id = $1 AND dimension = 'city'",
-        )
-        .bind(a)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        r.engine_updated_at = at(5);
-        r.texts[0].1 = "Wants to be understood; slow to warm up".into();
-        upsert_one(&pool, &r).await.unwrap();
-
-        assert_eq!(
-            observed(&pool, a).await.unwrap(),
-            vec![
-                obs("city", "Singapore", at(0), at(5)),
-                obs("love_values", "Wants to be understood", at(0), at(0)),
-                obs(
-                    "love_values",
-                    "Wants to be understood; slow to warm up",
-                    at(5),
-                    at(5)
-                ),
-            ]
-        );
-        assert_eq!(
-            current(&pool, a, "love_values").await.unwrap(),
-            vec!["Wants to be understood; slow to warm up"]
-        );
-        let again: DateTime<Utc> = sqlx::query_scalar(
-            "SELECT recorded_at FROM pothos.observed_phrases WHERE user_id = $1 AND dimension = 'city'",
-        )
-        .bind(a)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(again, first, "seeing a version again is not new material");
-    }
 }

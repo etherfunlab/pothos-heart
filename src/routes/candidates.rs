@@ -222,6 +222,8 @@ mod tests {
                 country: Some("SG".into()),
                 region: None,
                 city: city.map(String::from),
+                age_min: None,
+                age_max: None,
                 active,
             },
         )
@@ -253,9 +255,6 @@ mod tests {
                 interests: interests.iter().map(|s| s.to_string()).collect(),
                 personality_traits: traits.iter().map(|s| s.to_string()).collect(),
                 deal_breakers: vec![],
-                age_min: None,
-                age_max: None,
-                texts: vec![],
                 engine_updated_at: Utc::now(),
             },
         )

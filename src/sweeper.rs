@@ -9,7 +9,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::concepts::ConceptTask;
-use crate::db::memories;
+use crate::db::{erasures, facts, memories};
 use crate::db::mirror::{self, MirrorRow};
 use crate::engine_client::{EngineClient, EngineError, ExportRow};
 
@@ -21,50 +21,14 @@ pub enum SweepError {
     Db(#[from] sqlx::Error),
 }
 
-/// `v` cut to at most `mirror::MAX_TEXT_BYTES`, on a char boundary.
-fn cap_text(v: &str) -> &str {
-    if v.len() <= mirror::MAX_TEXT_BYTES {
-        return v;
-    }
-    let mut end = mirror::MAX_TEXT_BYTES;
-    while !v.is_char_boundary(end) {
-        end -= 1;
-    }
-    &v[..end]
-}
-
 impl From<&ExportRow> for MirrorRow {
     fn from(r: &ExportRow) -> Self {
-        // An inverted window (min > max) can match nobody, so it is dropped
-        // rather than mirrored: "no usable age preference" excludes no one.
-        let (age_min, age_max) = match (r.age_min, r.age_max) {
-            (Some(min), Some(max)) if min > max => (None, None),
-            window => window,
-        };
-        // Text values are trimmed and capped, case kept; arrays are
-        // canonicalised when written (`mirror::upsert_row`).
-        let texts = mirror::TEXT_FIELDS
-            .iter()
-            .filter_map(|f| {
-                let v = r.other.get(*f)?.as_str()?.trim();
-                if v.is_empty() {
-                    return None;
-                }
-                let kept = cap_text(v);
-                if kept.len() < v.len() {
-                    tracing::warn!(user_id = %r.user_id, field = f, "text value cut to the ledger cap");
-                }
-                Some((f.to_string(), kept.to_string()))
-            })
-            .collect();
+        // Arrays are canonicalised and capped when written (`mirror::upsert_row`).
         Self {
             user_id: r.user_id,
             interests: r.interests.clone(),
             personality_traits: r.personality_traits.clone(),
             deal_breakers: r.deal_breakers.clone(),
-            texts,
-            age_min,
-            age_max,
             engine_updated_at: r.updated_at,
         }
     }
@@ -132,6 +96,63 @@ pub async fn run_memories_once(pool: &PgPool, client: &EngineClient) -> Result<u
     Ok(total)
 }
 
+/// Walk the erasure (tombstone) stream from just behind its cursor to the
+/// end, dropping every erased user's mirrored and derived rows. Returns
+/// tombstones applied (re-fetched ones included).
+pub async fn run_erasures_once(pool: &PgPool, client: &EngineClient) -> Result<usize, SweepError> {
+    let (mut since, mut after_user) = match erasures::load_cursor(pool).await? {
+        Some(c) => (c.erased_at - OVERLAP, Uuid::nil()),
+        None => (DateTime::<Utc>::UNIX_EPOCH, Uuid::nil()),
+    };
+    let mut total = 0;
+    loop {
+        let page = client.deletions(since, after_user).await?;
+        if page.erasures.is_empty() {
+            break;
+        }
+        erasures::apply_page(pool, &page.erasures).await?;
+        total += page.erasures.len();
+        let Some(next) = page.next else { break };
+        if (next.erased_at, next.user_id) <= (since, after_user) {
+            tracing::warn!(?next, "engine erasure cursor did not advance; ending sweep");
+            break;
+        }
+        (since, after_user) = (next.erased_at, next.user_id);
+    }
+    Ok(total)
+}
+
+/// Walk the facts export from just behind its cursor to the end, like
+/// `run_memories_once`. Self-gating: a client without the facts secret skips
+/// the step (`Ok(0)`) without a request. Returns rows received (re-fetched
+/// ones included).
+pub async fn run_facts_once(pool: &PgPool, client: &EngineClient) -> Result<usize, SweepError> {
+    if !client.has_facts() {
+        tracing::debug!("no facts secret configured; facts step skipped");
+        return Ok(0);
+    }
+    let (mut since, mut after_id) = match facts::load_cursor(pool).await? {
+        Some(c) => (c.last_seen_at - OVERLAP, Uuid::nil()),
+        None => (DateTime::<Utc>::UNIX_EPOCH, Uuid::nil()),
+    };
+    let mut total = 0;
+    loop {
+        let page = client.facts_changes(since, after_id).await?;
+        if page.facts.is_empty() {
+            break;
+        }
+        facts::apply_page(pool, &page.facts).await?;
+        total += page.facts.len();
+        let Some(next) = page.next else { break };
+        if (next.last_seen_at, next.id) <= (since, after_id) {
+            tracing::warn!(?next, "engine facts cursor did not advance; ending sweep");
+            break;
+        }
+        (since, after_id) = (next.last_seen_at, next.id);
+    }
+    Ok(total)
+}
+
 /// Sweep forever at `interval`: mirror both exports, then run the model steps
 /// that are configured, whatever the earlier steps did. Errors are logged; the
 /// next tick retries from wherever each step stopped.
@@ -144,6 +165,19 @@ pub async fn run_loop(
     interval: Duration,
 ) {
     loop {
+        // Tombstones first, so the rest of the tick never works on data the
+        // engine has already erased.
+        match run_erasures_once(&pool, &client).await {
+            Ok(n) if n > 0 => tracing::info!(users = n, "erasure sweep"),
+            Ok(_) => tracing::debug!("erasure sweep: nothing new"),
+            // An engine older than the deletion streams.
+            Err(SweepError::Engine(EngineError::Status(404))) => {
+                tracing::debug!("engine has no deletion stream; skipped")
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "erasure sweep failed; cursor kept at last landed page")
+            }
+        }
         match run_once(&pool, &client).await {
             Ok(n) if n > 0 => tracing::info!(rows = n, "mirror sweep"),
             Ok(_) => tracing::debug!("mirror sweep: nothing new"),
@@ -156,13 +190,25 @@ pub async fn run_loop(
         match run_memories_once(&pool, &client).await {
             Ok(n) if n > 0 => tracing::info!(rows = n, "memories sweep"),
             Ok(_) => tracing::debug!("memories sweep: nothing new"),
-            // An engine older than the memories export: autobio uses the
-            // insights export alone.
+            // An engine older than the memories export: autobio runs on the
+            // material that is there.
             Err(SweepError::Engine(EngineError::Status(404))) => {
                 tracing::debug!("engine has no memories export; skipped")
             }
             Err(e) => {
                 tracing::warn!(error = ?e, "memories sweep failed; cursor kept at last landed page")
+            }
+        }
+        match run_facts_once(&pool, &client).await {
+            Ok(n) if n > 0 => tracing::info!(rows = n, "facts sweep"),
+            Ok(_) => tracing::debug!("facts sweep: nothing new"),
+            // An engine without the facts export mounted: autobio uses the
+            // memory material alone.
+            Err(SweepError::Engine(EngineError::Status(404))) => {
+                tracing::debug!("engine has no facts export; skipped")
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "facts sweep failed; cursor kept at last landed page")
             }
         }
         if let Some(task) = &concepts {
@@ -229,6 +275,7 @@ mod tests {
         EngineClient::new(&EngineConfig {
             base_url: server.uri(),
             export_secret: "s".repeat(32),
+            facts_secret: None,
         })
     }
 
@@ -306,9 +353,6 @@ mod tests {
                 interests: vec![],
                 personality_traits: vec![],
                 deal_breakers: vec![],
-                age_min: None,
-                age_max: None,
-                texts: vec![],
                 engine_updated_at: t,
             }],
         )
@@ -425,34 +469,6 @@ mod tests {
         );
     }
 
-    fn export_row(age_min: Option<i32>, age_max: Option<i32>) -> ExportRow {
-        ExportRow {
-            user_id: Uuid::new_v4(),
-            interests: vec![],
-            personality_traits: vec![],
-            deal_breakers: vec![],
-            age_min,
-            age_max,
-            other: Default::default(),
-            updated_at: Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap(),
-        }
-    }
-
-    #[test]
-    fn an_inverted_age_window_is_mirrored_as_no_preference() {
-        for ((min, max), want) in [
-            ((Some(30), Some(25)), (None, None)),
-            ((Some(25), Some(30)), (Some(25), Some(30))),
-            ((Some(30), Some(30)), (Some(30), Some(30))),
-            ((Some(30), None), (Some(30), None)),
-            ((None, Some(25)), (None, Some(25))),
-            ((None, None), (None, None)),
-        ] {
-            let m = MirrorRow::from(&export_row(min, max));
-            assert_eq!((m.age_min, m.age_max), want, "export ({min:?}, {max:?})");
-        }
-    }
-
     #[sqlx::test(migrations = "./migrations")]
     async fn a_failing_cursor_update_rolls_the_whole_page_back(pool: PgPool) {
         sqlx::query(
@@ -467,9 +483,6 @@ mod tests {
             interests: vec!["jazz".into()],
             personality_traits: vec![],
             deal_breakers: vec![],
-            age_min: None,
-            age_max: None,
-            texts: vec![],
             engine_updated_at: Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap(),
         }];
 
@@ -510,71 +523,8 @@ mod tests {
         assert!(mirror::exists(&pool, a).await.unwrap());
     }
 
-    #[test]
-    fn an_export_row_carries_the_text_columns_trimmed_and_never_preferred_gender() {
-        let row: ExportRow = serde_json::from_value(serde_json::json!({
-            "user_id": Uuid::new_v4(), "interests": [], "personality_traits": [],
-            "deal_breakers": [], "age_min": null, "age_max": null,
-            "updated_at": "2026-10-13T12:00:00Z",
-            "love_values": "  slow to warm up ", "city": "Singapore", "occupation": "   ",
-            "hometown": null, "preferred_gender": "m", "mbti_guess": 7
-        }))
-        .unwrap();
-        let mut texts = MirrorRow::from(&row).texts;
-        texts.sort();
-        assert_eq!(
-            texts,
-            vec![
-                ("city".to_string(), "Singapore".to_string()),
-                ("love_values".to_string(), "slow to warm up".to_string()),
-            ]
-        );
-    }
 
-    #[test]
-    fn an_over_long_text_value_is_cut_to_the_cap_on_a_char_boundary() {
-        let long = "爵".repeat(1400); // 4200 bytes
-        let row: ExportRow = serde_json::from_value(serde_json::json!({
-            "user_id": Uuid::new_v4(), "interests": [], "personality_traits": [],
-            "deal_breakers": [], "age_min": null, "age_max": null,
-            "updated_at": "2026-10-13T12:00:00Z",
-            "love_values": long, "city": "Singapore"
-        }))
-        .unwrap();
-        let texts = MirrorRow::from(&row).texts;
-        let love = &texts.iter().find(|(f, _)| f == "love_values").unwrap().1;
-        assert!(long.starts_with(love.as_str()));
-        assert!(love.len() <= mirror::MAX_TEXT_BYTES);
-        assert_eq!(love.chars().count(), 666);
-        assert!(texts.contains(&("city".to_string(), "Singapore".to_string())));
-    }
 
-    #[sqlx::test(migrations = "./migrations")]
-    async fn an_over_long_text_value_does_not_stall_the_page(pool: PgPool) {
-        let server = MockServer::start().await;
-        let a = Uuid::new_v4();
-        let long = "爵".repeat(1400);
-        Mock::given(method("GET"))
-            .and(path("/svc/v1/insights/changes"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "profiles": [{
-                    "user_id": a, "interests": [], "personality_traits": [],
-                    "deal_breakers": [], "age_min": null, "age_max": null,
-                    "updated_at": "2026-10-13T12:00:00Z", "love_values": long
-                }],
-                "next": null
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        assert_eq!(run_once(&pool, &client(&server)).await.unwrap(), 1);
-        assert!(mirror::exists(&pool, a).await.unwrap());
-        assert_eq!(
-            mirror::current(&pool, a, "love_values").await.unwrap(),
-            vec!["爵".repeat(666)]
-        );
-    }
 
     fn memory(id: Uuid, user: Uuid, ts: &str) -> serde_json::Value {
         serde_json::json!({
@@ -637,6 +587,203 @@ mod tests {
             .await;
         assert_eq!(run_memories_once(&pool, &client(&server)).await.unwrap(), 1);
         assert_eq!(mirrored_memories(&pool).await, 2);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn text_columns_in_the_export_are_ignored(pool: PgPool) {
+        let server = MockServer::start().await;
+        let a = Uuid::new_v4();
+        Mock::given(method("GET"))
+            .and(path("/svc/v1/insights/changes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "profiles": [{
+                    "user_id": a, "interests": ["jazz"], "personality_traits": [],
+                    "deal_breakers": [], "updated_at": "2026-10-13T12:00:00Z",
+                    "love_values": "slow to warm up", "occupation": "dev"
+                }],
+                "next": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(run_once(&pool, &client(&server)).await.unwrap(), 1);
+        let rows = mirror::observed(&pool, a).await.unwrap();
+        assert_eq!(rows.len(), 1, "only the array phrase enters the ledger");
+        assert_eq!(rows[0].dimension, "interests");
+        assert_eq!(rows[0].phrase, "jazz");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn erasures_walk_two_pages_and_resume_overlap_behind(pool: PgPool) {
+        let server = MockServer::start().await;
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let t1 = "2026-10-13T12:00:00Z";
+        let t2 = "2026-10-13T12:05:00Z";
+        Mock::given(method("GET"))
+            .and(path("/svc/v1/insights/deletions"))
+            .and(query_param("since", "1970-01-01T00:00:00Z"))
+            .and(query_param(
+                "after_user",
+                "00000000-0000-0000-0000-000000000000",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "erasures": [{ "user_id": a, "erased_at": t1 }],
+                "next": { "erased_at": t1, "user_id": a }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/svc/v1/insights/deletions"))
+            .and(query_param("since", t1))
+            .and(query_param("after_user", a.to_string().as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "erasures": [{ "user_id": b, "erased_at": t2 }], "next": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(run_erasures_once(&pool, &client(&server)).await.unwrap(), 2);
+        let cur = crate::db::erasures::load_cursor(&pool).await.unwrap().unwrap();
+        assert_eq!(cur.user_id, b);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/svc/v1/insights/deletions"))
+            .and(query_param("since", "2026-10-13T12:04:55Z"))
+            .and(query_param(
+                "after_user",
+                "00000000-0000-0000-0000-000000000000",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "erasures": [{ "user_id": b, "erased_at": t2 }], "next": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(run_erasures_once(&pool, &client(&server)).await.unwrap(), 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn erasures_404_leaves_cursor_untouched(pool: PgPool) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let err = run_erasures_once(&pool, &client(&server))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SweepError::Engine(EngineError::Status(404))));
+        assert!(crate::db::erasures::load_cursor(&pool)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    fn facts_client(server: &MockServer) -> EngineClient {
+        EngineClient::new(&EngineConfig {
+            base_url: server.uri(),
+            export_secret: "s".repeat(32),
+            facts_secret: Some("f".repeat(32)),
+        })
+    }
+
+    async fn mirrored_facts(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM pothos.fact_mirror")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn facts_walk_two_pages_and_resume_overlap_behind(pool: PgPool) {
+        use crate::engine_client::FACTS_SECRET_HEADER;
+        let server = MockServer::start().await;
+        let u = Uuid::new_v4();
+        let (f1, f2) = (Uuid::new_v4(), Uuid::new_v4());
+        let t1 = "2026-10-13T12:00:00Z";
+        let t2 = "2026-10-13T12:05:00Z";
+        let fact = |id: Uuid, last: &str| {
+            serde_json::json!({
+                "id": id, "user_id": u, "content": "c", "category": "fact",
+                "domain": "other", "evidence_type": "explicit_statement",
+                "temporality": "current", "persistence": "stable",
+                "confidence": "high", "occurrences": 1, "session_count": 1,
+                "recurrence": "once", "first_seen_at": t1, "last_seen_at": last
+            })
+        };
+        Mock::given(method("GET"))
+            .and(path("/svc/v1/facts/changes"))
+            .and(wiremock::matchers::header(
+                FACTS_SECRET_HEADER,
+                "f".repeat(32).as_str(),
+            ))
+            .and(query_param("since", "1970-01-01T00:00:00Z"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "facts": [fact(f1, t1)],
+                "next": { "last_seen_at": t1, "id": f1 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/svc/v1/facts/changes"))
+            .and(query_param("since", t1))
+            .and(query_param("after_id", f1.to_string().as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "facts": [fact(f2, t2)], "next": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(run_facts_once(&pool, &facts_client(&server)).await.unwrap(), 2);
+        assert_eq!(mirrored_facts(&pool).await, 2);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/svc/v1/facts/changes"))
+            .and(query_param("since", "2026-10-13T12:04:55Z"))
+            .and(query_param(
+                "after_id",
+                "00000000-0000-0000-0000-000000000000",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                // The overlap re-returns a row already stored: a no-op.
+                "facts": [fact(f2, t2)], "next": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(run_facts_once(&pool, &facts_client(&server)).await.unwrap(), 1);
+        assert_eq!(mirrored_facts(&pool).await, 2);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn facts_without_a_secret_skip_without_a_request(pool: PgPool) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        assert_eq!(run_facts_once(&pool, &client(&server)).await.unwrap(), 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn facts_404_leaves_cursor_and_mirror_untouched(pool: PgPool) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let err = run_facts_once(&pool, &facts_client(&server))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SweepError::Engine(EngineError::Status(404))));
+        assert!(crate::db::facts::load_cursor(&pool).await.unwrap().is_none());
+        assert_eq!(mirrored_facts(&pool).await, 0);
     }
 
     #[sqlx::test(migrations = "./migrations")]

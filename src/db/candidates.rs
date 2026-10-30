@@ -59,9 +59,8 @@ pub async fn hard_filtered(pool: &PgPool, me: Uuid) -> sqlx::Result<Vec<Candidat
             SELECT p.user_id, p.gender, p.seeking_genders, p.birth_date, \
                    COALESCE(s.current_likes, '{}')         AS current_likes, \
                    COALESCE(s.current_deal_breakers, '{}') AS current_deal_breakers, \
-                   m.age_min, m.age_max \
+                   p.age_min, p.age_max \
             FROM pothos.match_profiles p \
-            LEFT JOIN pothos.insight_mirror m USING (user_id) \
             LEFT JOIN sets s USING (user_id) \
             WHERE p.user_id = $1 \
          ), pool AS ( \
@@ -71,9 +70,8 @@ pub async fn hard_filtered(pool: &PgPool, me: Uuid) -> sqlx::Result<Vec<Candidat
                    COALESCE(s.personality_traits, '{}')    AS personality_traits, \
                    COALESCE(s.current_likes, '{}')         AS current_likes, \
                    COALESCE(s.current_deal_breakers, '{}') AS current_deal_breakers, \
-                   cm.age_min, cm.age_max \
+                   c.age_min, c.age_max \
             FROM pothos.match_profiles c \
-            LEFT JOIN pothos.insight_mirror cm USING (user_id) \
             LEFT JOIN sets s USING (user_id) \
             WHERE c.active \
          ) \
@@ -133,6 +131,8 @@ mod tests {
                 country: Some("SG".into()),
                 region: None,
                 city: None,
+                age_min: None,
+                age_max: None,
                 active,
             },
         )
@@ -141,14 +141,7 @@ mod tests {
         id
     }
 
-    async fn mirror(
-        pool: &PgPool,
-        id: Uuid,
-        interests: &[&str],
-        traits: &[&str],
-        deal: &[&str],
-        age: Option<(i32, i32)>,
-    ) {
+    async fn mirror(pool: &PgPool, id: Uuid, interests: &[&str], traits: &[&str], deal: &[&str]) {
         mirror::upsert_one(
             pool,
             &MirrorRow {
@@ -156,14 +149,22 @@ mod tests {
                 interests: interests.iter().map(|s| s.to_string()).collect(),
                 personality_traits: traits.iter().map(|s| s.to_string()).collect(),
                 deal_breakers: deal.iter().map(|s| s.to_string()).collect(),
-                age_min: age.map(|a| a.0),
-                age_max: age.map(|a| a.1),
-                texts: vec![],
                 engine_updated_at: Utc::now(),
             },
         )
         .await
         .unwrap();
+    }
+
+    /// The user's own age window, as the product layer would have pushed it.
+    async fn age_prefs(pool: &PgPool, id: Uuid, min: i32, max: i32) {
+        sqlx::query("UPDATE pothos.match_profiles SET age_min = $2, age_max = $3 WHERE user_id = $1")
+            .bind(id)
+            .bind(min)
+            .bind(max)
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     fn t0() -> DateTime<Utc> {
@@ -190,9 +191,6 @@ mod tests {
                 interests: interests.iter().map(|s| s.to_string()).collect(),
                 personality_traits: traits.iter().map(|s| s.to_string()).collect(),
                 deal_breakers: deal.iter().map(|s| s.to_string()).collect(),
-                age_min: None,
-                age_max: None,
-                texts: vec![],
                 engine_updated_at: t,
             },
         )
@@ -229,15 +227,15 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn age_filters_both_ways_only_when_both_sides_have_data(pool: PgPool) {
         let me = profile(&pool, "f", &["m"], Some(years_ago(30)), true).await;
-        mirror(&pool, me, &[], &[], &[], Some((25, 35))).await;
+        age_prefs(&pool, me, 25, 35).await;
 
         let in_range = profile(&pool, "m", &["f"], Some(years_ago(28)), true).await;
         let too_old = profile(&pool, "m", &["f"], Some(years_ago(40)), true).await;
         let no_birth_date = profile(&pool, "m", &["f"], None, true).await;
         let his_prefs_exclude_me = profile(&pool, "m", &["f"], Some(years_ago(28)), true).await;
-        mirror(&pool, his_prefs_exclude_me, &[], &[], &[], Some((18, 24))).await;
+        age_prefs(&pool, his_prefs_exclude_me, 18, 24).await;
         let his_prefs_include_me = profile(&pool, "m", &["f"], Some(years_ago(28)), true).await;
-        mirror(&pool, his_prefs_include_me, &[], &[], &[], Some((25, 40))).await;
+        age_prefs(&pool, his_prefs_include_me, 25, 40).await;
 
         let got = ids(&pool, me).await;
         let mut expected = vec![in_range, no_birth_date, his_prefs_include_me];
@@ -265,7 +263,7 @@ mod tests {
     ) {
         // me: 29-30 years old, wants 25-35.
         let me = profile(&pool, "f", &["m"], Some(years_ago(30)), true).await;
-        mirror(&pool, me, &[], &[], &[], Some((25, 35))).await;
+        age_prefs(&pool, me, 25, 35).await;
 
         let control = profile(&pool, "m", &["f"], Some(years_ago(28)), true).await;
 
@@ -275,12 +273,12 @@ mod tests {
         // Inside my range, but I am below HIS age_min; his own age (32-33)
         // would satisfy his own minimum, so only my age can exclude him.
         let his_min_above_me = profile(&pool, "m", &["f"], Some(years_ago(33)), true).await;
-        mirror(&pool, his_min_above_me, &[], &[], &[], Some((32, 45))).await;
+        age_prefs(&pool, his_min_above_me, 32, 45).await;
 
         // Inside my range, but I am above HIS age_max; his own age (26-27)
         // would satisfy his own maximum, so only my age can exclude him.
         let his_max_below_me = profile(&pool, "m", &["f"], Some(years_ago(27)), true).await;
-        mirror(&pool, his_max_below_me, &[], &[], &[], Some((18, 28))).await;
+        age_prefs(&pool, his_max_below_me, 18, 28).await;
 
         let got = ids(&pool, me).await;
         assert_eq!(got, vec![control]);
@@ -292,9 +290,9 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn me_without_birth_date_is_not_excluded_by_a_candidates_age_prefs(pool: PgPool) {
         let me = profile(&pool, "f", &["m"], None, true).await;
-        mirror(&pool, me, &[], &[], &[], None).await;
+        mirror(&pool, me, &[], &[], &[]).await;
         let him = profile(&pool, "m", &["f"], Some(years_ago(21)), true).await;
-        mirror(&pool, him, &[], &[], &[], Some((18, 24))).await;
+        age_prefs(&pool, him, 18, 24).await;
 
         assert_eq!(ids(&pool, me).await, vec![him]);
     }
@@ -302,7 +300,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn me_without_age_prefs_does_not_filter_on_age(pool: PgPool) {
         let me = profile(&pool, "f", &["m"], Some(years_ago(30)), true).await;
-        mirror(&pool, me, &["jazz"], &[], &[], None).await;
+        mirror(&pool, me, &["jazz"], &[], &[]).await;
         let any_age = profile(&pool, "m", &["f"], Some(years_ago(60)), true).await;
         assert_eq!(ids(&pool, me).await, vec![any_age]);
     }
@@ -310,18 +308,18 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn deal_breakers_apply_both_ways_to_interests_and_traits(pool: PgPool) {
         let me = profile(&pool, "f", &["m"], None, true).await;
-        mirror(&pool, me, &["jazz"], &["calm"], &["smoking"], None).await;
+        mirror(&pool, me, &["jazz"], &["calm"], &["smoking"]).await;
 
         let smokes_interest = profile(&pool, "m", &["f"], None, true).await;
-        mirror(&pool, smokes_interest, &["smoking"], &[], &[], None).await;
+        mirror(&pool, smokes_interest, &["smoking"], &[], &[]).await;
         let smokes_trait = profile(&pool, "m", &["f"], None, true).await;
-        mirror(&pool, smokes_trait, &[], &["smoking"], &[], None).await;
+        mirror(&pool, smokes_trait, &[], &["smoking"], &[]).await;
         let hates_jazz = profile(&pool, "m", &["f"], None, true).await;
-        mirror(&pool, hates_jazz, &[], &[], &["jazz"], None).await;
+        mirror(&pool, hates_jazz, &[], &[], &["jazz"]).await;
         let hates_calm = profile(&pool, "m", &["f"], None, true).await;
-        mirror(&pool, hates_calm, &[], &[], &["calm"], None).await;
+        mirror(&pool, hates_calm, &[], &[], &["calm"]).await;
         let fine = profile(&pool, "m", &["f"], None, true).await;
-        mirror(&pool, fine, &["tea"], &["loud"], &["gambling"], None).await;
+        mirror(&pool, fine, &["tea"], &["loud"], &["gambling"]).await;
         let no_mirror_at_all = profile(&pool, "m", &["f"], None, true).await;
 
         let got = ids(&pool, me).await;
@@ -334,7 +332,7 @@ mod tests {
     async fn mirror_only_users_never_surface(pool: PgPool) {
         let me = profile(&pool, "f", &["m"], None, true).await;
         let ghost = Uuid::new_v4(); // synced from the engine, never pushed by the product layer
-        mirror(&pool, ghost, &["jazz"], &[], &[], None).await;
+        mirror(&pool, ghost, &["jazz"], &[], &[]).await;
         assert!(ids(&pool, me).await.is_empty());
     }
 
@@ -342,7 +340,7 @@ mod tests {
     async fn candidate_rows_carry_geo_and_arrays_for_scoring(pool: PgPool) {
         let me = profile(&pool, "f", &["m"], None, true).await;
         let him = profile(&pool, "m", &["f"], None, true).await;
-        mirror(&pool, him, &["jazz", "tea"], &["calm"], &[], None).await;
+        mirror(&pool, him, &["jazz", "tea"], &["calm"], &[]).await;
         let rows = hard_filtered(&pool, me).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].country.as_deref(), Some("SG"));

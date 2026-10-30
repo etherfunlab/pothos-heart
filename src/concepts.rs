@@ -304,9 +304,6 @@ mod tests {
                 interests: interests.iter().map(|s| s.to_string()).collect(),
                 personality_traits: vec![],
                 deal_breakers: vec![],
-                age_min: None,
-                age_max: None,
-                texts: vec![],
                 engine_updated_at: Utc.with_ymd_and_hms(2026, 10, 15, 12, 0, 0).unwrap(),
             },
         )

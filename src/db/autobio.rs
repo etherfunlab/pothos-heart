@@ -2,12 +2,13 @@
 //! statement under a fixed section; revising it retires the row and adds one
 //! that points back, so retired rows are the revision history.
 //!
-//! The material is the phrase ledger (array items and text-column versions)
-//! and the memory mirror. `recorded_at` on both is when this service first
-//! stored a row; `autobio_state.material_until` is how far a user's entries
-//! have taken it in. The sweeper is the only writer of both tables and runs
-//! its steps in sequence, so every row recorded before the autobio step reads
-//! the clock is already committed.
+//! The material is the fact mirror and the memory mirror. `recorded_at` on
+//! both is this service's clock (a fact's moves again when the engine row
+//! changes); `autobio_state.material_until` is how far a user's entries have
+//! taken it in. The sweeper is the only writer of both tables and runs its
+//! steps in sequence, so every row recorded before the autobio step reads the
+//! clock is already committed. Phrase-ledger rows are matching material, not
+//! autobio material; `o:` refs survive only as the history of old entries.
 
 use std::collections::HashMap;
 
@@ -31,8 +32,10 @@ pub const STATUSES: [&str; 3] = ["current", "past", "planned"];
 /// A piece of material, as an entry cites it and the model sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceRef {
+    /// A phrase-ledger row: history on pre-v0.4 entries, never new material.
     Observed(i64),
     Memory(Uuid),
+    Fact(Uuid),
 }
 
 impl SourceRef {
@@ -40,6 +43,7 @@ impl SourceRef {
         match self {
             Self::Observed(id) => format!("o:{id}"),
             Self::Memory(id) => format!("m:{id}"),
+            Self::Fact(id) => format!("f:{id}"),
         }
     }
 
@@ -48,6 +52,7 @@ impl SourceRef {
         match kind {
             "o" => id.parse().ok().map(Self::Observed),
             "m" => id.parse().ok().map(Self::Memory),
+            "f" => id.parse().ok().map(Self::Fact),
             _ => None,
         }
     }
@@ -56,9 +61,11 @@ impl SourceRef {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Material {
     pub source: SourceRef,
-    /// The ledger dimension, or `memory/<category>`.
+    /// `fact/<category>` or `memory/<category>`.
     pub kind: String,
     pub text: String,
+    /// A memory's extraction hints verbatim; a fact's labels, counters,
+    /// `last_seen_at` and `seen_again`, built here.
     pub metadata: Option<serde_json::Value>,
     /// When the engine first said it: `first_seen_at` / `engine_created_at`.
     pub at: DateTime<Utc>,
@@ -97,7 +104,7 @@ pub async fn due_users(
 ) -> sqlx::Result<Vec<Due>> {
     sqlx::query_as(
         "WITH material AS ( \
-            SELECT user_id, recorded_at FROM pothos.observed_phrases \
+            SELECT user_id, recorded_at FROM pothos.fact_mirror \
             UNION ALL \
             SELECT user_id, recorded_at FROM pothos.memory_mirror \
          ) \
@@ -117,14 +124,34 @@ pub async fn due_users(
     .await
 }
 
-/// One user's material recorded after `after` (all of it when `None`).
+/// One user's material recorded after `after` (all of it when `None`),
+/// oldest last said first: facts order by `last_seen_at`, memories by
+/// `engine_created_at`, so an old fact said again reads as recent.
 pub async fn material(
     pool: &PgPool,
     user_id: Uuid,
     after: Option<DateTime<Utc>>,
 ) -> sqlx::Result<Vec<Material>> {
-    let observed: Vec<(i64, String, String, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT id, dimension, phrase, first_seen_at FROM pothos.observed_phrases \
+    #[derive(sqlx::FromRow)]
+    struct FactMaterial {
+        id: Uuid,
+        content: String,
+        category: String,
+        domain: String,
+        evidence_type: String,
+        temporality: String,
+        persistence: String,
+        confidence: String,
+        occurrences: i32,
+        session_count: i32,
+        recurrence: String,
+        first_seen_at: DateTime<Utc>,
+        last_seen_at: DateTime<Utc>,
+    }
+    let facts: Vec<FactMaterial> = sqlx::query_as(
+        "SELECT id, content, category, domain, evidence_type, temporality, persistence, \
+                confidence, occurrences, session_count, recurrence, first_seen_at, last_seen_at \
+         FROM pothos.fact_mirror \
          WHERE user_id = $1 AND ($2::timestamptz IS NULL OR recorded_at > $2)",
     )
     .bind(user_id)
@@ -146,32 +173,58 @@ pub async fn material(
     .bind(after)
     .fetch_all(pool)
     .await?;
-    let mut out: Vec<Material> = observed
+    let mut out: Vec<(DateTime<Utc>, Material)> = facts
         .into_iter()
-        .map(|(id, dimension, text, at)| Material {
-            source: SourceRef::Observed(id),
-            kind: dimension,
-            text,
-            metadata: None,
-            at,
+        .map(|f| {
+            // A fact first said before the watermark is back because it was
+            // said again: it confirms, it is not news.
+            let seen_again = after.is_some_and(|a| f.first_seen_at <= a);
+            let metadata = serde_json::json!({
+                "domain": f.domain,
+                "evidence_type": f.evidence_type,
+                "temporality": f.temporality,
+                "persistence": f.persistence,
+                "confidence": f.confidence,
+                "recurrence": f.recurrence,
+                "occurrences": f.occurrences,
+                "session_count": f.session_count,
+                "last_seen_at": f.last_seen_at
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "seen_again": seen_again,
+            });
+            (
+                f.last_seen_at,
+                Material {
+                    source: SourceRef::Fact(f.id),
+                    kind: format!("fact/{}", f.category),
+                    text: f.content,
+                    metadata: Some(metadata),
+                    at: f.first_seen_at,
+                },
+            )
         })
         .chain(
             memories
                 .into_iter()
-                .map(|(id, category, text, metadata, at)| Material {
-                    source: SourceRef::Memory(id),
-                    kind: format!("memory/{category}"),
-                    text,
-                    metadata,
-                    at,
+                .map(|(id, category, text, metadata, at)| {
+                    (
+                        at,
+                        Material {
+                            source: SourceRef::Memory(id),
+                            kind: format!("memory/{category}"),
+                            text,
+                            metadata,
+                            at,
+                        },
+                    )
                 }),
         )
         .collect();
-    out.sort_by(|a, b| {
-        a.at.cmp(&b.at)
+    out.sort_by(|(a_ts, a), (b_ts, b)| {
+        a_ts.cmp(b_ts)
             .then_with(|| a.source.tag().cmp(&b.source.tag()))
     });
-    Ok(out)
+    Ok(out.into_iter().map(|(_, m)| m).collect())
 }
 
 /// A user's current entries with their sources, oldest first.
@@ -203,6 +256,16 @@ pub async fn current_entries(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Vec<E
     .bind(user_id)
     .fetch_all(pool)
     .await?;
+    let facts: Vec<(i64, Uuid, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT s.entry_id, s.fact_id, f.first_seen_at \
+         FROM pothos.autobio_fact_sources s \
+         JOIN pothos.autobio_entries e ON e.id = s.entry_id \
+         JOIN pothos.fact_mirror f ON f.id = s.fact_id \
+         WHERE e.user_id = $1 AND e.retired_at IS NULL ORDER BY s.fact_id",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
     let mut sources: HashMap<i64, Vec<(SourceRef, DateTime<Utc>)>> = HashMap::new();
     for (entry, id, at) in observed {
         sources
@@ -215,6 +278,12 @@ pub async fn current_entries(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Vec<E
             .entry(entry)
             .or_default()
             .push((SourceRef::Memory(id), at));
+    }
+    for (entry, id, at) in facts {
+        sources
+            .entry(entry)
+            .or_default()
+            .push((SourceRef::Fact(id), at));
     }
     Ok(rows
         .into_iter()
@@ -313,6 +382,47 @@ pub async fn in_pool_now(pool: &PgPool, user_id: Uuid) -> sqlx::Result<bool> {
     in_pool(&mut *pool.acquire().await?, user_id).await
 }
 
+/// Whether every fact and memory source is still mirrored. An erasure
+/// tombstone can remove them while the model is answering; an op citing a
+/// vanished source is skipped, never a failed transaction.
+async fn sources_exist(conn: &mut PgConnection, sources: &[SourceRef]) -> sqlx::Result<bool> {
+    let ids = |f: fn(&SourceRef) -> Option<Uuid>| -> Vec<Uuid> {
+        sources.iter().filter_map(f).collect()
+    };
+    for (table, column, wanted) in [
+        (
+            "fact_mirror",
+            "id",
+            ids(|s| match s {
+                SourceRef::Fact(id) => Some(*id),
+                _ => None,
+            }),
+        ),
+        (
+            "memory_mirror",
+            "id",
+            ids(|s| match s {
+                SourceRef::Memory(id) => Some(*id),
+                _ => None,
+            }),
+        ),
+    ] {
+        if wanted.is_empty() {
+            continue;
+        }
+        let n: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM pothos.{table} WHERE {column} = ANY($1)"
+        ))
+        .bind(&wanted)
+        .fetch_one(&mut *conn)
+        .await?;
+        if n as usize != wanted.len() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Apply one reply's operations and move the watermark, in one transaction.
 /// An operation on an entry that is no longer current (the owner deleted it
 /// while the model was answering) is dropped. A user who is no longer in
@@ -339,6 +449,9 @@ pub async fn apply(
                 statement,
                 sources,
             } => {
+                if !sources_exist(&mut tx, sources).await? {
+                    continue;
+                }
                 let id = insert_entry(&mut tx, user_id, section, status, statement, None).await?;
                 link(&mut tx, id, sources).await?;
                 done.added += 1;
@@ -349,6 +462,9 @@ pub async fn apply(
                 statement,
                 sources,
             } => {
+                if !sources_exist(&mut tx, sources).await? {
+                    continue;
+                }
                 let Some(section) = retire(&mut tx, user_id, *entry, "revised").await? else {
                     continue;
                 };
@@ -463,6 +579,14 @@ async fn carry_sources(conn: &mut PgConnection, from: i64, to: i64) -> sqlx::Res
     .bind(to)
     .execute(&mut *conn)
     .await?;
+    sqlx::query(
+        "INSERT INTO pothos.autobio_fact_sources (entry_id, fact_id) \
+         SELECT $2, fact_id FROM pothos.autobio_fact_sources WHERE entry_id = $1",
+    )
+    .bind(from)
+    .bind(to)
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 
@@ -482,6 +606,16 @@ async fn link(conn: &mut PgConnection, entry: i64, sources: &[SourceRef]) -> sql
             SourceRef::Memory(id) => {
                 sqlx::query(
                     "INSERT INTO pothos.autobio_memory_sources (entry_id, memory_id) \
+                     VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                )
+                .bind(entry)
+                .bind(id)
+                .execute(&mut *conn)
+                .await?;
+            }
+            SourceRef::Fact(id) => {
+                sqlx::query(
+                    "INSERT INTO pothos.autobio_fact_sources (entry_id, fact_id) \
                      VALUES ($1, $2) ON CONFLICT DO NOTHING",
                 )
                 .bind(entry)
@@ -519,6 +653,8 @@ pub(crate) mod tests {
                 country: None,
                 region: None,
                 city: None,
+                age_min: None,
+                age_max: None,
                 active,
             },
         )
@@ -526,23 +662,65 @@ pub(crate) mod tests {
         .unwrap();
     }
 
-    pub(crate) async fn export(pool: &PgPool, id: Uuid, t: DateTime<Utc>, texts: &[(&str, &str)]) {
+    pub(crate) async fn export(pool: &PgPool, id: Uuid, t: DateTime<Utc>, interests: &[&str]) {
         mirror::upsert_one(
             pool,
             &MirrorRow {
                 user_id: id,
-                interests: vec![],
+                interests: interests.iter().map(|s| s.to_string()).collect(),
                 personality_traits: vec![],
                 deal_breakers: vec![],
-                texts: texts
-                    .iter()
-                    .map(|(f, v)| (f.to_string(), v.to_string()))
-                    .collect(),
-                age_min: None,
-                age_max: None,
                 engine_updated_at: t,
             },
         )
+        .await
+        .unwrap();
+    }
+
+    /// One ledger fact mirrored as the sweeper would store it.
+    pub(crate) async fn fact(
+        pool: &PgPool,
+        user: Uuid,
+        content: &str,
+        first: DateTime<Utc>,
+        last: DateTime<Utc>,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        crate::db::facts::apply_page(
+            pool,
+            &[crate::engine_client::FactRow {
+                id,
+                user_id: user,
+                content: content.into(),
+                category: "preference".into(),
+                domain: "hobby".into(),
+                evidence_type: "explicit_statement".into(),
+                temporality: "current".into(),
+                persistence: "ongoing".into(),
+                confidence: "medium".into(),
+                occurrences: 1,
+                session_count: 1,
+                recurrence: "once".into(),
+                first_seen_at: first,
+                last_seen_at: last,
+            }],
+        )
+        .await
+        .unwrap();
+        id
+    }
+
+    /// The same fact seen again: counters up, `last_seen_at` moved.
+    pub(crate) async fn fact_seen_again(pool: &PgPool, id: Uuid, user: Uuid, last: DateTime<Utc>) {
+        sqlx::query(
+            "UPDATE pothos.fact_mirror SET occurrences = occurrences + 1, session_count = 2, \
+                recurrence = 'repeated_across_sessions', last_seen_at = $2, recorded_at = now() \
+             WHERE id = $1 AND user_id = $3",
+        )
+        .bind(id)
+        .bind(last)
+        .bind(user)
+        .execute(pool)
         .await
         .unwrap();
     }
@@ -597,51 +775,82 @@ pub(crate) mod tests {
     #[test]
     fn source_refs_round_trip_and_reject_junk() {
         let m = Uuid::new_v4();
-        for r in [SourceRef::Observed(12), SourceRef::Memory(m)] {
+        for r in [
+            SourceRef::Observed(12),
+            SourceRef::Memory(m),
+            SourceRef::Fact(m),
+        ] {
             assert_eq!(SourceRef::parse(&r.tag()), Some(r));
         }
         assert_eq!(SourceRef::Observed(12).tag(), "o:12");
-        for junk in ["", "o:", "o:x", "m:not-a-uuid", "x:1", "12", "o:1:2"] {
+        assert_eq!(SourceRef::Fact(m).tag(), format!("f:{m}"));
+        for junk in ["", "o:", "o:x", "m:not-a-uuid", "f:12", "x:1", "12", "o:1:2"] {
             assert_eq!(SourceRef::parse(junk), None, "{junk}");
         }
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn material_is_everything_first_then_only_what_arrived_after_the_watermark(pool: PgPool) {
+    async fn material_renders_a_fact_with_its_labels(pool: PgPool) {
         let a = Uuid::new_v4();
-        export(&pool, a, at(0), &[("love_values", "slow to warm up")]).await;
-        let m = memory(&pool, a, "likes hiking", at(1)).await;
+        let f = fact(&pool, a, "plays weekend jazz", at(0), at(3)).await;
         let other = Uuid::new_v4();
-        memory(&pool, other, "not mine", at(1)).await;
+        fact(&pool, other, "not mine", at(0), at(0)).await;
 
         let all = material(&pool, a, None).await.unwrap();
-        let o = observed_id(&pool, a, "love_values", "slow to warm up").await;
+        assert_eq!(all.len(), 1);
+        let got = &all[0];
+        assert_eq!(got.source, SourceRef::Fact(f));
+        assert_eq!(got.kind, "fact/preference");
+        assert_eq!(got.text, "plays weekend jazz");
+        assert_eq!(got.at, at(0), "`at` is when it was first said");
+        let meta = got.metadata.as_ref().unwrap();
+        assert_eq!(meta["domain"], "hobby");
+        assert_eq!(meta["evidence_type"], "explicit_statement");
+        assert_eq!(meta["temporality"], "current");
+        assert_eq!(meta["persistence"], "ongoing");
+        assert_eq!(meta["confidence"], "medium");
+        assert_eq!(meta["recurrence"], "once");
+        assert_eq!(meta["occurrences"], 1);
+        assert_eq!(meta["session_count"], 1);
         assert_eq!(
-            all.iter()
-                .map(|x| (x.source, x.kind.as_str(), x.text.as_str()))
-                .collect::<Vec<_>>(),
-            vec![
-                (SourceRef::Observed(o), "love_values", "slow to warm up"),
-                (SourceRef::Memory(m), "memory/preference", "likes hiking"),
-            ]
+            meta["last_seen_at"],
+            at(3).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         );
-        assert_eq!(all[1].metadata.as_ref().unwrap()["domain"], "hobby");
+        assert_eq!(meta["seen_again"], false, "no watermark: nothing is a repeat");
+    }
 
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_fact_reseen_after_the_watermark_is_material_again_marked_seen_again(pool: PgPool) {
+        let a = Uuid::new_v4();
+        let f = fact(&pool, a, "plays weekend jazz", at(0), at(0)).await;
         let watermark = db_now(&pool).await.unwrap();
-        assert!(material(&pool, a, Some(watermark))
-            .await
-            .unwrap()
-            .is_empty());
-        export(
-            &pool,
-            a,
-            at(5),
-            &[("love_values", "slow to warm up; loyal")],
-        )
-        .await;
+        assert!(material(&pool, a, Some(watermark)).await.unwrap().is_empty());
+
+        fact_seen_again(&pool, f, a, at(5)).await;
         let later = material(&pool, a, Some(watermark)).await.unwrap();
         assert_eq!(later.len(), 1);
-        assert_eq!(later[0].text, "slow to warm up; loyal");
+        assert_eq!(later[0].source, SourceRef::Fact(f));
+        let meta = later[0].metadata.as_ref().unwrap();
+        assert_eq!(meta["seen_again"], true);
+        assert_eq!(meta["recurrence"], "repeated_across_sessions");
+        assert_eq!(meta["occurrences"], 2);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn material_is_ordered_by_when_it_was_last_said(pool: PgPool) {
+        let a = Uuid::new_v4();
+        // An old fact re-seen at t9 sorts after a memory from t7, even though
+        // the fact was first said at t0.
+        let f = fact(&pool, a, "plays weekend jazz", at(0), at(9)).await;
+        let m = memory(&pool, a, "likes hiking", at(7)).await;
+
+        let all = material(&pool, a, None).await.unwrap();
+        assert_eq!(
+            all.iter().map(|x| x.source).collect::<Vec<_>>(),
+            vec![SourceRef::Memory(m), SourceRef::Fact(f)]
+        );
+        assert_eq!(all[1].at, at(0), "`at` still shows the first time");
+        assert_eq!(all[0].metadata.as_ref().unwrap()["domain"], "hobby");
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -656,8 +865,12 @@ pub(crate) mod tests {
             join_pool(&pool, id, active).await;
         }
         for id in [fresh, waiting, outsider, inactive] {
-            export(&pool, id, at(0), &[("city", "Singapore")]).await;
+            fact(&pool, id, "plays weekend jazz", at(0), at(0)).await;
         }
+        // A phrase-ledger row is matching material, not autobio material.
+        let ledger_only = Uuid::new_v4();
+        join_pool(&pool, ledger_only, true).await;
+        export(&pool, ledger_only, at(0), &["steady walks"]).await;
         // `waiting` ran a moment ago and has taken in everything so far.
         let now = db_now(&pool).await.unwrap();
         sqlx::query(
@@ -675,6 +888,10 @@ pub(crate) mod tests {
             .unwrap();
         let ids: Vec<Uuid> = due.iter().map(|d| d.user_id).collect();
         assert_eq!(ids, vec![fresh, inactive]);
+        assert!(
+            !ids.contains(&ledger_only),
+            "ledger-only material does not make a user due"
+        );
         assert!(due.iter().all(|d| d.material_until.is_none()));
 
         // The interval has passed for `waiting`, but nothing new has arrived: not due.
@@ -686,7 +903,7 @@ pub(crate) mod tests {
         );
 
         // New material for `waiting`: still not due inside the interval, due after it.
-        export(&pool, waiting, at(5), &[("city", "Tokyo")]).await;
+        memory(&pool, waiting, "took up pottery", at(5)).await;
         let later = db_now(&pool).await.unwrap();
         let inside = due_users(&pool, now - chrono::Duration::hours(1), 10)
             .await
@@ -702,9 +919,10 @@ pub(crate) mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn current_entries_carry_sources_and_the_latest_source_time(pool: PgPool) {
         let a = Uuid::new_v4();
-        export(&pool, a, at(0), &[("city", "Singapore")]).await;
-        let o = observed_id(&pool, a, "city", "Singapore").await;
+        export(&pool, a, at(0), &["singapore nights"]).await;
+        let o = observed_id(&pool, a, "interests", "singapore nights").await;
         let m = memory(&pool, a, "moved here in 2020", at(7)).await;
+        let f = fact(&pool, a, "works near the marina", at(9), at(9)).await;
         let e = entry(&pool, a, "basics", "Lives in Singapore").await;
         sqlx::query("INSERT INTO pothos.autobio_observed_sources VALUES ($1, $2)")
             .bind(e)
@@ -715,6 +933,12 @@ pub(crate) mod tests {
         sqlx::query("INSERT INTO pothos.autobio_memory_sources VALUES ($1, $2)")
             .bind(e)
             .bind(m)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO pothos.autobio_fact_sources VALUES ($1, $2)")
+            .bind(e)
+            .bind(f)
             .execute(&pool)
             .await
             .unwrap();
@@ -731,11 +955,20 @@ pub(crate) mod tests {
         let got = current_entries(&pool, a).await.unwrap();
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].id, e);
-        assert_eq!(got[0].as_of, Some(at(7)));
         assert_eq!(
-            got[0].sources,
-            vec![SourceRef::Observed(o), SourceRef::Memory(m)]
+            got[0].as_of,
+            Some(at(9)),
+            "the fact's first_seen_at is its anchor"
         );
+        let mut sources = got[0].sources.clone();
+        sources.sort_by_key(SourceRef::tag);
+        let mut expected = vec![
+            SourceRef::Observed(o),
+            SourceRef::Memory(m),
+            SourceRef::Fact(f),
+        ];
+        expected.sort_by_key(SourceRef::tag);
+        assert_eq!(sources, expected);
         assert_eq!(
             (got[1].id, got[1].as_of, got[1].sources.len()),
             (bare, None, 0)
@@ -787,14 +1020,7 @@ pub(crate) mod tests {
     async fn apply_adds_revises_and_retires_and_moves_the_watermark(pool: PgPool) {
         let a = Uuid::new_v4();
         join_pool(&pool, a, true).await;
-        export(
-            &pool,
-            a,
-            at(0),
-            &[("relationship_history", "single for two years")],
-        )
-        .await;
-        let o = observed_id(&pool, a, "relationship_history", "single for two years").await;
+        let f = fact(&pool, a, "single for two years", at(0), at(0)).await;
         let m = memory(&pool, a, "seeing someone lately", at(9)).await;
         let until = db_now(&pool).await.unwrap();
 
@@ -805,7 +1031,7 @@ pub(crate) mod tests {
                 section: "love".into(),
                 status: "current".into(),
                 statement: "Has been single for two years".into(),
-                sources: vec![SourceRef::Observed(o)],
+                sources: vec![SourceRef::Fact(f)],
             }],
             until,
             "m1",
@@ -856,7 +1082,7 @@ pub(crate) mod tests {
         assert_eq!(now[0].status, "past");
         assert_eq!(
             now[0].sources,
-            vec![SourceRef::Observed(o), SourceRef::Memory(m)],
+            vec![SourceRef::Memory(m), SourceRef::Fact(f)],
             "old sources carried, new one added"
         );
         let (supersedes, reason): (Option<i64>, Option<String>) = sqlx::query_as(
@@ -879,6 +1105,46 @@ pub(crate) mod tests {
                 .unwrap();
         assert_eq!(retracted.as_deref(), Some("retracted"));
         assert_eq!(state(&pool, a).await, (Some(until2), "m2".to_string()));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_revise_carries_pre_v04_observed_sources_to_the_new_entry(pool: PgPool) {
+        let a = Uuid::new_v4();
+        join_pool(&pool, a, true).await;
+        export(&pool, a, at(0), &["jazz nights"]).await;
+        let o = observed_id(&pool, a, "interests", "jazz nights").await;
+        let e = entry(&pool, a, "life", "Out for jazz most weekends").await;
+        sqlx::query("INSERT INTO pothos.autobio_observed_sources VALUES ($1, $2)")
+            .bind(e)
+            .bind(o)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let m = memory(&pool, a, "prefers quiet bars now", at(5)).await;
+        let until = db_now(&pool).await.unwrap();
+
+        apply(
+            &pool,
+            a,
+            &[Op::Revise {
+                entry: e,
+                status: "past".into(),
+                statement: "Used to go out for jazz".into(),
+                sources: vec![SourceRef::Memory(m)],
+            }],
+            until,
+            "m",
+        )
+        .await
+        .unwrap();
+
+        let got = current_entries(&pool, a).await.unwrap();
+        assert_eq!(got.len(), 1);
+        let mut sources = got[0].sources.clone();
+        sources.sort_by_key(SourceRef::tag);
+        let mut expected = vec![SourceRef::Memory(m), SourceRef::Observed(o)];
+        expected.sort_by_key(SourceRef::tag);
+        assert_eq!(sources, expected, "the o: history rides the revision");
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -936,16 +1202,55 @@ pub(crate) mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn nothing_is_written_for_a_user_who_left_the_pool(pool: PgPool) {
+    async fn an_op_whose_source_was_erased_is_skipped_not_fatal(pool: PgPool) {
         let a = Uuid::new_v4();
-        export(
+        join_pool(&pool, a, true).await;
+        let f = fact(&pool, a, "plays weekend jazz", at(0), at(0)).await;
+        let m = memory(&pool, a, "likes hiking", at(1)).await;
+        let until = db_now(&pool).await.unwrap();
+        // A tombstone lands between the material read and the write.
+        sqlx::query("DELETE FROM pothos.fact_mirror WHERE id = $1")
+            .bind(f)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let add = |statement: &str, source: SourceRef| Op::Add {
+            section: "life".into(),
+            status: "current".into(),
+            statement: statement.into(),
+            sources: vec![source],
+        };
+        let done = apply(
             &pool,
             a,
-            at(0),
-            &[("relationship_history", "single for two years")],
+            &[
+                add("Plays jazz on weekends", SourceRef::Fact(f)),
+                add("Likes hiking", SourceRef::Memory(m)),
+            ],
+            until,
+            "m",
         )
-        .await;
-        let o = observed_id(&pool, a, "relationship_history", "single for two years").await;
+        .await
+        .unwrap();
+        assert_eq!(
+            done,
+            Applied {
+                added: 1,
+                ..Default::default()
+            },
+            "the erased source's op is skipped, its sibling lands"
+        );
+        let got = current_entries(&pool, a).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].statement, "Likes hiking");
+        assert_eq!(state(&pool, a).await, (Some(until), "m".to_string()));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn nothing_is_written_for_a_user_who_left_the_pool(pool: PgPool) {
+        let a = Uuid::new_v4();
+        let f = fact(&pool, a, "single for two years", at(0), at(0)).await;
         // No match_profiles row: the user left while the model was answering.
         let until = db_now(&pool).await.unwrap();
 
@@ -956,7 +1261,7 @@ pub(crate) mod tests {
                 section: "love".into(),
                 status: "current".into(),
                 statement: "Has been single for two years".into(),
-                sources: vec![SourceRef::Observed(o)],
+                sources: vec![SourceRef::Fact(f)],
             }],
             until,
             "m",

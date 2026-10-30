@@ -59,8 +59,12 @@ The input is JSON:
 - `entries`: the current entries, each with `entry` (its id), `section`, `status`, `as_of` \
 (year-month of its latest source, or null), `statement`, `sources` (refs), and `unsupported` \
 (true when every source is gone).
-- `material`: new material, each with `ref`, `kind`, `at` (when it was first said), `text` and, \
-for memories, `metadata`. `kind` is the profile field or list it came from, or `memory/<category>`.
+- `material`: new material, each with `ref`, `kind` (`fact/<category>` or `memory/<category>`), \
+`at` (when it was first said), `text` and `metadata`. A fact's metadata carries the extraction \
+labels (`domain`, `evidence_type`, `confidence`, `recurrence`, counters, `last_seen_at`) and \
+`seen_again`. Weigh wording by `confidence` and `recurrence`: a low-confidence one-off reads as \
+\"possibly\". A fact marked `seen_again` was material before and confirms or strengthens what it \
+already supports: revise that entry rather than add a duplicate.
 - `deleted_by_owner`: statements the person deleted from their autobio.
 
 Operations:
@@ -69,8 +73,8 @@ adds an entry; it needs at least one source.
 - {{\"op\": \"revise\", \"entry\": id, \"status\": ..., \"statement\": ..., \"sources\": [refs]}} \
 rewrites an entry. It keeps its section and its sources; list only the sources you add.
 - {{\"op\": \"retire\", \"entry\": id}} removes an entry the material contradicts or no longer supports.
-Each entry takes at most one operation. A source is a `ref` from `material` or from a current \
-entry's `sources`.
+Each entry takes at most one operation. A source is a `ref` from `material`, or an `f:` or `m:` \
+ref from a current entry's `sources`; `o:` refs are history and cannot be cited.
 
 Rules:
 - One thing per entry, in the third person, in {language}, at most {MAX_STATEMENT_CHARS} \
@@ -79,7 +83,7 @@ characters. Keep concrete detail, negation, degree and uncertainty as the materi
 diagnose. A cause the person stated may be recorded.
 - When new material contradicts an entry, revise it (mark it `past`, or rewrite it) so two \
 versions never stand side by side.
-- `material` is oldest first; a later version of the same profile field replaces an earlier one.
+- `material` is ordered by when it was last said, oldest first.
 - `status` is `current`, `past` or `planned`. A `planned` entry becomes `past` or `current` only \
 when material says it happened. Never write relative time such as \"last year\" or \"recently\"; \
 an entry's time comes from its sources.
@@ -147,7 +151,8 @@ pub fn user_prompt(
 }
 
 /// What a reply may refer to: the current entries, and the sources in play
-/// (this run's material plus every current entry's sources).
+/// (this run's material plus every current entry's fact and memory sources).
+/// `o:` refs are pre-v0.4 history: rendered on their entries, never citable.
 pub struct Allowed {
     entries: HashSet<i64>,
     sources: HashSet<SourceRef>,
@@ -161,6 +166,7 @@ impl Allowed {
                 .iter()
                 .map(|m| m.source)
                 .chain(entries.iter().flat_map(|e| e.sources.iter().copied()))
+                .filter(|s| !matches!(s, SourceRef::Observed(_)))
                 .collect(),
         }
     }
@@ -352,23 +358,38 @@ mod tests {
         let m = Uuid::new_v4();
         let mut with_meta = mat(SourceRef::Memory(m), "memory/preference", "x");
         with_meta.metadata = Some(serde_json::json!({"evidence_type": "roleplay_expression"}));
+        let f = fref(5);
+        let mut fact_mat = mat(SourceRef::Fact(f), "fact/preference", odd);
+        fact_mat.metadata = Some(serde_json::json!({
+            "domain": "hobby", "evidence_type": "explicit_statement",
+            "confidence": "medium", "recurrence": "once",
+            "occurrences": 1, "session_count": 1,
+            "last_seen_at": "2026-09-14T08:00:00Z", "seen_again": false
+        }));
         let now = Utc.with_ymd_and_hms(2026, 10, 15, 12, 0, 0).unwrap();
         let v: serde_json::Value = serde_json::from_str(&user_prompt(
             now,
             &[ent(7, vec![SourceRef::Observed(3)]), ent(8, vec![])],
-            &[mat(SourceRef::Observed(3), "love_values", odd), with_meta],
+            &[fact_mat, with_meta],
             &["deleted one".to_string()],
         ))
         .unwrap();
         assert_eq!(v["now"], "2026-10-15T12:00:00Z");
         assert_eq!(v["material"][0]["text"], odd);
-        assert_eq!(v["material"][0]["ref"], "o:3");
+        assert_eq!(v["material"][0]["ref"], format!("f:{f}"));
+        assert_eq!(v["material"][0]["kind"], "fact/preference");
         assert_eq!(v["material"][0]["at"], "2026-09-14T08:00:00Z");
+        assert_eq!(v["material"][0]["metadata"]["domain"], "hobby");
+        assert_eq!(v["material"][0]["metadata"]["seen_again"], false);
         assert_eq!(
             v["material"][1]["metadata"]["evidence_type"],
             "roleplay_expression"
         );
-        assert_eq!(v["entries"][0]["sources"], serde_json::json!(["o:3"]));
+        assert_eq!(
+            v["entries"][0]["sources"],
+            serde_json::json!(["o:3"]),
+            "pre-v0.4 history still renders on the entry"
+        );
         assert_eq!(v["entries"][0]["unsupported"], false);
         assert_eq!(v["entries"][1]["unsupported"], true);
         assert_eq!(v["deleted_by_owner"], serde_json::json!(["deleted one"]));
@@ -382,30 +403,41 @@ mod tests {
         }
         assert!(p.contains("zh-Hans"));
         assert!(p.contains(&format!("{MAX_STATEMENT_CHARS} characters")));
-        assert!(p.contains(
-            "`material` is oldest first; a later version of the same profile field replaces an \
-earlier one."
-        ));
+        assert!(p.contains("`material` is ordered by when it was last said"));
+        assert!(p.contains("`seen_again`"));
+        assert!(p.contains("`o:` refs are history and cannot be cited"));
+    }
+
+    /// Fixed refs for parse tests: `fref(4)` is material, `mref(3)` a current
+    /// entry's source, `o:3` the same entry's pre-v0.4 history.
+    fn fref(n: u128) -> Uuid {
+        Uuid::from_u128(n)
     }
 
     fn allowed() -> Allowed {
         Allowed::new(
-            &[ent(7, vec![SourceRef::Observed(3)]), ent(8, vec![])],
-            &[mat(SourceRef::Observed(4), "city", "x")],
+            &[
+                ent(7, vec![SourceRef::Observed(3), SourceRef::Memory(fref(3))]),
+                ent(8, vec![]),
+            ],
+            &[mat(SourceRef::Fact(fref(4)), "fact/preference", "x")],
         )
     }
 
     #[test]
     fn parse_reads_each_operation() {
-        let content = r#"```json
-{"ops":[
- {"op":"add","section":"basics","status":"current","statement":"  Lives in Singapore ","sources":["o:4"]},
- {"op":"revise","entry":7,"status":"past","statement":"Was single","sources":["o:4","o:4"]},
- {"op":"revise","entry":8,"status":"current","statement":"No new source"},
- {"op":"retire","entry":9999}
-]}
-```"#;
-        let (ops, skipped) = parse(content, &allowed()).unwrap();
+        let f = fref(4);
+        let content = format!(
+            r#"```json
+{{"ops":[
+ {{"op":"add","section":"basics","status":"current","statement":"  Lives in Singapore ","sources":["f:{f}"]}},
+ {{"op":"revise","entry":7,"status":"past","statement":"Was single","sources":["f:{f}","f:{f}"]}},
+ {{"op":"revise","entry":8,"status":"current","statement":"No new source"}},
+ {{"op":"retire","entry":9999}}
+]}}
+```"#
+        );
+        let (ops, skipped) = parse(&content, &allowed()).unwrap();
         assert_eq!(
             ops,
             vec![
@@ -413,13 +445,13 @@ earlier one."
                     section: "basics".into(),
                     status: "current".into(),
                     statement: "Lives in Singapore".into(),
-                    sources: vec![SourceRef::Observed(4)],
+                    sources: vec![SourceRef::Fact(fref(4))],
                 },
                 Op::Revise {
                     entry: 7,
                     status: "past".into(),
                     statement: "Was single".into(),
-                    sources: vec![SourceRef::Observed(4)],
+                    sources: vec![SourceRef::Fact(fref(4))],
                 },
                 Op::Revise {
                     entry: 8,
@@ -439,19 +471,19 @@ earlier one."
             {"op": "add", "section": "life", "status": "current", "statement": "a",
              "sources": [format!("m:{stranger}")]},
             {"op": "add", "section": "life", "status": "current", "statement": "b",
-             "sources": ["o:999999"]},
+             "sources": [format!("f:{}", Uuid::new_v4())]},
             {"op": "add", "section": "life", "status": "current", "statement": "c",
-             "sources": ["o:3"]},
+             "sources": [format!("m:{}", fref(3))]},
             {"op": "add", "section": "life", "status": "current", "statement": "d", "sources": []},
-            {"op": "add", "section": "hobbies", "status": "current", "statement": "e", "sources": ["o:4"]},
-            {"op": "add", "section": "life", "status": "maybe", "statement": "f", "sources": ["o:4"]},
+            {"op": "add", "section": "hobbies", "status": "current", "statement": "e", "sources": [format!("f:{}", fref(4))]},
+            {"op": "add", "section": "life", "status": "maybe", "statement": "f", "sources": [format!("f:{}", fref(4))]},
             {"op": "revise", "entry": 7, "status": "past", "statement": "g"},
             {"op": "retire", "entry": 7},
             {"op": "merge", "entry": 8}
         ]})
         .to_string();
         let (ops, skipped) = parse(&content, &allowed()).unwrap();
-        // Only "c" survives: o:3 is a current entry's source, so it is in play.
+        // Only "c" survives: m:… is a current entry's source, so it is in play.
         assert_eq!(ops.len(), 1);
         assert!(matches!(&ops[0], Op::Add { statement, .. } if statement == "c"));
         // a, b: not in play; d: no source; e, f: bad section/status;
@@ -460,13 +492,48 @@ earlier one."
     }
 
     #[test]
+    fn an_op_citing_an_observed_ref_is_skipped_and_siblings_land() {
+        // Entry 7 carries `o:3` as pre-v0.4 history; it is not citable.
+        let content = serde_json::json!({"ops": [
+            {"op": "add", "section": "life", "status": "current", "statement": "from history",
+             "sources": ["o:3"]},
+            {"op": "add", "section": "life", "status": "current", "statement": "from a fact",
+             "sources": [format!("f:{}", fref(4))]}
+        ]})
+        .to_string();
+        let (ops, skipped) = parse(&content, &allowed()).unwrap();
+        assert_eq!(skipped, 1);
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(&ops[0], Op::Add { statement, .. } if statement == "from a fact"));
+    }
+
+    #[test]
+    fn fact_refs_are_citable_from_material_and_from_entries() {
+        // Material carries f:9; entry 7 already cites f:8.
+        let a = Allowed::new(
+            &[ent(7, vec![SourceRef::Fact(fref(8))])],
+            &[mat(SourceRef::Fact(fref(9)), "fact/preference", "x")],
+        );
+        let content = serde_json::json!({"ops": [
+            {"op": "add", "section": "life", "status": "current", "statement": "new",
+             "sources": [format!("f:{}", fref(9))]},
+            {"op": "revise", "entry": 7, "status": "current", "statement": "merged",
+             "sources": [format!("f:{}", fref(8))]}
+        ]})
+        .to_string();
+        let (ops, skipped) = parse(&content, &a).unwrap();
+        assert_eq!((ops.len(), skipped), (2, 0));
+    }
+
+    #[test]
     fn parse_counts_statement_characters_not_bytes() {
         let at_cap = "爵".repeat(MAX_STATEMENT_CHARS);
         let over = "爵".repeat(MAX_STATEMENT_CHARS + 1);
+        let f = format!("f:{}", fref(4));
         let content = serde_json::json!({"ops": [
-            {"op": "add", "section": "life", "status": "current", "statement": at_cap, "sources": ["o:4"]},
-            {"op": "add", "section": "life", "status": "current", "statement": over, "sources": ["o:4"]},
-            {"op": "add", "section": "life", "status": "current", "statement": "   ", "sources": ["o:4"]}
+            {"op": "add", "section": "life", "status": "current", "statement": at_cap, "sources": [f]},
+            {"op": "add", "section": "life", "status": "current", "statement": over, "sources": [f]},
+            {"op": "add", "section": "life", "status": "current", "statement": "   ", "sources": [f]}
         ]})
         .to_string();
         let (ops, skipped) = parse(&content, &allowed()).unwrap();
@@ -475,10 +542,11 @@ earlier one."
 
     #[test]
     fn parse_skips_a_statement_holding_a_nul() {
+        let f = format!("f:{}", fref(4));
         let content = serde_json::json!({"ops": [
-            {"op": "add", "section": "life", "status": "current", "statement": "a\u{0}b", "sources": ["o:4"]},
+            {"op": "add", "section": "life", "status": "current", "statement": "a\u{0}b", "sources": [f]},
             {"op": "revise", "entry": 7, "status": "current", "statement": "\u{0}"},
-            {"op": "add", "section": "life", "status": "current", "statement": "ok", "sources": ["o:4"]}
+            {"op": "add", "section": "life", "status": "current", "statement": "ok", "sources": [f]}
         ]})
         .to_string();
         assert!(content.contains("\\u0000"));
@@ -524,16 +592,15 @@ earlier one."
     async fn a_tick_writes_entries_from_the_reply_and_the_next_one_sees_only_new_material(
         pool: PgPool,
     ) {
-        use crate::db::autobio::tests::{at, export, join_pool, observed_id};
+        use crate::db::autobio::tests::{at, fact, join_pool, memory};
         let server = MockServer::start().await;
         let a = Uuid::new_v4();
         join_pool(&pool, a, true).await;
-        export(&pool, a, at(0), &[("city", "Singapore")]).await;
-        let o = observed_id(&pool, a, "city", "Singapore").await;
+        let f = fact(&pool, a, "Singapore", at(0), at(0)).await;
         Mock::given(method("POST"))
             .respond_with(reply(
                 serde_json::json!({"ops": [{"op": "add", "section": "basics", "status": "current",
-                    "statement": "Lives in Singapore", "sources": [format!("o:{o}")]}]})
+                    "statement": "Lives in Singapore", "sources": [format!("f:{f}")]}]})
                 .to_string(),
             ))
             .expect(1)
@@ -550,7 +617,7 @@ earlier one."
         );
 
         // Inside the interval nothing is due, whatever arrives.
-        export(&pool, a, at(5), &[("city", "Tokyo")]).await;
+        memory(&pool, a, "Tokyo", at(5)).await;
         assert_eq!(
             run_once(&pool, &task(&server)).await.unwrap(),
             TickReport::default()
@@ -574,11 +641,11 @@ earlier one."
 
     #[sqlx::test(migrations = "./migrations")]
     async fn an_unreadable_reply_writes_nothing_and_keeps_the_watermark(pool: PgPool) {
-        use crate::db::autobio::tests::{at, export, join_pool};
+        use crate::db::autobio::tests::{at, fact, join_pool};
         let server = MockServer::start().await;
         let a = Uuid::new_v4();
         join_pool(&pool, a, true).await;
-        export(&pool, a, at(0), &[("city", "Singapore")]).await;
+        fact(&pool, a, "Singapore", at(0), at(0)).await;
         Mock::given(method("POST"))
             .respond_with(reply("sorry, no"))
             .mount(&server)
@@ -603,12 +670,12 @@ earlier one."
 
     #[sqlx::test(migrations = "./migrations")]
     async fn an_llm_failure_stamps_the_user_and_ends_the_tick(pool: PgPool) {
-        use crate::db::autobio::tests::{at, export, join_pool};
+        use crate::db::autobio::tests::{at, fact, join_pool};
         let server = MockServer::start().await;
         for _ in 0..2 {
             let id = Uuid::new_v4();
             join_pool(&pool, id, true).await;
-            export(&pool, id, at(0), &[("city", "Singapore")]).await;
+            fact(&pool, id, "Singapore", at(0), at(0)).await;
         }
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(500))
@@ -629,12 +696,12 @@ earlier one."
 
     #[sqlx::test(migrations = "./migrations")]
     async fn a_user_who_leaves_before_their_turn_gets_no_call(pool: PgPool) {
-        use crate::db::autobio::tests::{at, export, join_pool};
+        use crate::db::autobio::tests::{at, fact, join_pool};
         let server = MockServer::start().await;
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
         for (id, city) in [(a, "Singapore"), (b, "Tokyo")] {
             join_pool(&pool, id, true).await;
-            export(&pool, id, at(0), &[("city", city)]).await;
+            fact(&pool, id, city, at(0), at(0)).await;
         }
         // Both are due; `b` leaves while `a`'s call is in flight.
         Mock::given(method("POST"))
@@ -657,14 +724,14 @@ earlier one."
 
     #[sqlx::test(migrations = "./migrations")]
     async fn a_refused_request_stamps_that_user_and_the_tick_goes_on(pool: PgPool) {
-        use crate::db::autobio::tests::{at, export, join_pool, observed_id};
+        use crate::db::autobio::tests::{at, fact, join_pool};
         let server = MockServer::start().await;
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut fb = Uuid::nil();
         for (id, city) in [(a, "Singapore"), (b, "Tokyo")] {
             join_pool(&pool, id, true).await;
-            export(&pool, id, at(0), &[("city", city)]).await;
+            fb = fact(&pool, id, city, at(0), at(0)).await;
         }
-        let o = observed_id(&pool, b, "city", "Tokyo").await;
         Mock::given(method("POST"))
             .and(body_string_contains("Singapore"))
             .respond_with(ResponseTemplate::new(403))
@@ -675,7 +742,7 @@ earlier one."
             .and(body_string_contains("Tokyo"))
             .respond_with(reply(
                 serde_json::json!({"ops": [{"op": "add", "section": "basics", "status": "current",
-                    "statement": "Lives in Tokyo", "sources": [format!("o:{o}")]}]})
+                    "statement": "Lives in Tokyo", "sources": [format!("f:{fb}")]}]})
                 .to_string(),
             ))
             .expect(1)

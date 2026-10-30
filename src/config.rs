@@ -16,6 +16,8 @@ const MAX_AUTOBIO_MIN_INTERVAL_SECS: u64 = 31_536_000;
 pub struct EngineConfig {
     pub base_url: String,
     pub export_secret: String,
+    /// Unset turns the facts step off; autobio then runs on memory material alone.
+    pub facts_secret: Option<String>,
 }
 
 impl std::fmt::Debug for EngineConfig {
@@ -23,6 +25,7 @@ impl std::fmt::Debug for EngineConfig {
         f.debug_struct("EngineConfig")
             .field("base_url", &self.base_url)
             .field("export_secret", &"<redacted>")
+            .field("facts_secret", &self.facts_secret.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -185,6 +188,7 @@ impl Config {
             (Some(base_url), Some(export_secret)) => Some(EngineConfig {
                 base_url: base_url.trim_end_matches('/').to_string(),
                 export_secret,
+                facts_secret: nonblank("ENGINE_FACTS_SECRET"),
             }),
             (Some(_), None) => {
                 return Err("ENGINE_BASE_URL is set but ENGINE_EXPORT_SECRET is not".into())
@@ -193,6 +197,12 @@ impl Config {
                 return Err("ENGINE_EXPORT_SECRET is set but ENGINE_BASE_URL is not".into())
             }
         };
+        if engine.is_none() && nonblank("ENGINE_FACTS_SECRET").is_some() {
+            return Err(
+                "ENGINE_FACTS_SECRET is set but ENGINE_BASE_URL and ENGINE_EXPORT_SECRET are not"
+                    .into(),
+            );
+        }
 
         let sweep_interval = if truthy(get("SWEEP_DISABLED")) {
             Duration::ZERO
@@ -471,6 +481,43 @@ mod tests {
         .unwrap();
         let e = c.engine.unwrap();
         assert_eq!(e.base_url, "http://engine:8080", "trailing slash trimmed");
+        assert!(e.facts_secret.is_none(), "unset facts secret stays unset");
+    }
+
+    #[test]
+    fn facts_secret_rides_the_engine_pair() {
+        let c = Config::parse(env(&[
+            ("DATABASE_URL", "postgres://x"),
+            ("POTHOS_CALLER_SECRET", SECRET),
+            ("ENGINE_BASE_URL", "http://engine:8080"),
+            ("ENGINE_EXPORT_SECRET", SECRET),
+            ("ENGINE_FACTS_SECRET", "f-secret"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            c.engine.unwrap().facts_secret.as_deref(),
+            Some("f-secret")
+        );
+
+        // Blank counts as unset.
+        let c = Config::parse(env(&[
+            ("DATABASE_URL", "postgres://x"),
+            ("POTHOS_CALLER_SECRET", SECRET),
+            ("ENGINE_BASE_URL", "http://engine:8080"),
+            ("ENGINE_EXPORT_SECRET", SECRET),
+            ("ENGINE_FACTS_SECRET", "   "),
+        ]))
+        .unwrap();
+        assert!(c.engine.unwrap().facts_secret.is_none());
+
+        // Set without the engine pair refuses boot.
+        let err = Config::parse(env(&[
+            ("DATABASE_URL", "postgres://x"),
+            ("POTHOS_CALLER_SECRET", SECRET),
+            ("ENGINE_FACTS_SECRET", "f-secret"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("ENGINE_FACTS_SECRET"), "{err}");
     }
 
     #[test]
