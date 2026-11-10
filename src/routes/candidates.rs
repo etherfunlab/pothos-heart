@@ -607,4 +607,59 @@ mod tests {
         .await;
         assert!(queued(&pool).await.is_empty());
     }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_deleted_source_clears_chemistry_until_the_pair_is_judged_again(pool: PgPool) {
+        use crate::db::autobio::tests::{entry, fact};
+        use crate::db::verdicts::{pair, Grade};
+        use crate::engine_client::RowDeletion;
+        let me = profile(&pool, "f", &["m"], None).await;
+        mirror(&pool, me, &["jazz"], &[]).await;
+        let him = profile(&pool, "m", &["f"], None).await;
+        mirror(&pool, him, &["jazz"], &[]).await;
+        entry(&pool, him, "life", "y").await;
+        // Two entries of mine, each resting on one fact.
+        let now = chrono::Utc::now();
+        let mut facts = Vec::new();
+        for statement in ["Likes jazz.", "Hikes."] {
+            let f = fact(&pool, me, statement, now, now).await;
+            let e = entry(&pool, me, "life", statement).await;
+            sqlx::query("INSERT INTO pothos.autobio_fact_sources VALUES ($1, $2)")
+                .bind(e)
+                .bind(f)
+                .execute(&pool)
+                .await
+                .unwrap();
+            facts.push(f);
+        }
+        judged(&pool, me, him, Grade::Strong).await;
+        let delete = |id| RowDeletion {
+            kind: "fact".into(),
+            id,
+            deleted_at: now,
+        };
+        let uri = format!("/v1/match/candidates/{me}");
+        let state = || crate::state::test_state_with_llm(pool.clone());
+
+        // One entry gone, one standing: no grade, and the pair is judged again.
+        crate::db::row_deletions::apply_page(&pool, &[delete(facts[0])])
+            .await
+            .unwrap();
+        let body = get_with(state(), &uri).await;
+        assert!(body["candidates"][0]["chemistry"].is_null());
+        assert_eq!(queued(&pool).await, vec![pair(me, him)]);
+
+        sqlx::query("DELETE FROM pothos.judge_queue")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The last entry gone: no autobio, so the pair is not queued again.
+        crate::db::row_deletions::apply_page(&pool, &[delete(facts[1])])
+            .await
+            .unwrap();
+        let body = get_with(state(), &uri).await;
+        assert!(body["candidates"][0]["chemistry"].is_null());
+        assert!(queued(&pool).await.is_empty());
+    }
 }

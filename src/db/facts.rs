@@ -34,7 +34,8 @@ pub async fn apply_page(pool: &PgPool, rows: &[FactRow]) -> sqlx::Result<()> {
                 (id, user_id, content, category, domain, evidence_type, temporality, \
                  persistence, confidence, occurrences, session_count, recurrence, \
                  first_seen_at, last_seen_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14 \
+             WHERE NOT EXISTS (SELECT 1 FROM pothos.row_tombstones WHERE kind = 'fact' AND id = $1) \
              ON CONFLICT (id) DO UPDATE SET \
                 content = EXCLUDED.content, category = EXCLUDED.category, \
                 domain = EXCLUDED.domain, evidence_type = EXCLUDED.evidence_type, \
@@ -120,7 +121,9 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn a_reseen_fact_updates_the_row_and_bumps_recorded_at(pool: PgPool) {
         let (f, u) = (Uuid::new_v4(), Uuid::new_v4());
-        apply_page(&pool, &[fact(f, u, at(0), at(0))]).await.unwrap();
+        apply_page(&pool, &[fact(f, u, at(0), at(0))])
+            .await
+            .unwrap();
         let (_, _, _, _, recorded_first) = stored(&pool, f).await;
 
         let mut seen_again = fact(f, u, at(0), at(5));
@@ -150,5 +153,36 @@ mod tests {
         apply_page(&pool, &[row]).await.unwrap();
         let after = stored(&pool, f).await;
         assert_eq!(before, after, "an unchanged row is not new material");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_tombstoned_id_is_not_mirrored(pool: PgPool) {
+        let (gone, live, u) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        // A memory tombstone with the live fact's id is another stream's row.
+        for (kind, id) in [("fact", gone), ("memory", live)] {
+            sqlx::query(
+                "INSERT INTO pothos.row_tombstones (kind, id, deleted_at) VALUES ($1, $2, now())",
+            )
+            .bind(kind)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        apply_page(
+            &pool,
+            &[fact(gone, u, at(0), at(0)), fact(live, u, at(1), at(1))],
+        )
+        .await
+        .unwrap();
+
+        let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM pothos.fact_mirror")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(ids, vec![live]);
+        let cur = load_cursor(&pool).await.unwrap().unwrap();
+        assert_eq!((cur.last_seen_at, cur.id), (at(1), live));
     }
 }

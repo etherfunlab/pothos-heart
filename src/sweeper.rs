@@ -9,8 +9,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::concepts::ConceptTask;
-use crate::db::{erasures, facts, memories};
 use crate::db::mirror::{self, MirrorRow};
+use crate::db::{erasures, facts, memories, row_deletions};
 use crate::engine_client::{EngineClient, EngineError, ExportRow};
 
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +122,38 @@ pub async fn run_erasures_once(pool: &PgPool, client: &EngineClient) -> Result<u
     Ok(total)
 }
 
+/// Walk the row-deletion stream from just behind its cursor to the end,
+/// dropping each deleted memory or fact from its mirror. Returns tombstones
+/// applied (re-fetched ones included).
+pub async fn run_row_deletions_once(
+    pool: &PgPool,
+    client: &EngineClient,
+) -> Result<usize, SweepError> {
+    let (mut since, mut after_id) = match row_deletions::load_cursor(pool).await? {
+        Some(c) => (c.deleted_at - OVERLAP, Uuid::nil()),
+        None => (DateTime::<Utc>::UNIX_EPOCH, Uuid::nil()),
+    };
+    let mut total = 0;
+    loop {
+        let page = client.row_deletions(since, after_id).await?;
+        if page.deletions.is_empty() {
+            break;
+        }
+        row_deletions::apply_page(pool, &page.deletions).await?;
+        total += page.deletions.len();
+        let Some(next) = page.next else { break };
+        if (next.deleted_at, next.id) <= (since, after_id) {
+            tracing::warn!(
+                ?next,
+                "engine row-deletion cursor did not advance; ending sweep"
+            );
+            break;
+        }
+        (since, after_id) = (next.deleted_at, next.id);
+    }
+    Ok(total)
+}
+
 /// Walk the facts export from just behind its cursor to the end, like
 /// `run_memories_once`. Self-gating: a client without the facts secret skips
 /// the step (`Ok(0)`) without a request. Returns rows received (re-fetched
@@ -176,6 +208,19 @@ pub async fn run_loop(
             }
             Err(e) => {
                 tracing::warn!(error = ?e, "erasure sweep failed; cursor kept at last landed page")
+            }
+        }
+        // Single rows their owner deleted, before the changes steps for the
+        // same reason.
+        match run_row_deletions_once(&pool, &client).await {
+            Ok(n) if n > 0 => tracing::info!(rows = n, "row-deletion sweep"),
+            Ok(_) => tracing::debug!("row-deletion sweep: nothing new"),
+            // An engine older than the row-deletion stream.
+            Err(SweepError::Engine(EngineError::Status(404))) => {
+                tracing::debug!("engine has no row-deletion stream; skipped")
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "row-deletion sweep failed; cursor kept at last landed page")
             }
         }
         match run_once(&pool, &client).await {
@@ -523,9 +568,6 @@ mod tests {
         assert!(mirror::exists(&pool, a).await.unwrap());
     }
 
-
-
-
     fn memory(id: Uuid, user: Uuid, ts: &str) -> serde_json::Value {
         serde_json::json!({
             "id": id, "user_id": user, "content": "c", "category": "fact",
@@ -645,7 +687,10 @@ mod tests {
             .mount(&server)
             .await;
         assert_eq!(run_erasures_once(&pool, &client(&server)).await.unwrap(), 2);
-        let cur = crate::db::erasures::load_cursor(&pool).await.unwrap().unwrap();
+        let cur = crate::db::erasures::load_cursor(&pool)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cur.user_id, b);
 
         let server = MockServer::start().await;
@@ -677,6 +722,101 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, SweepError::Engine(EngineError::Status(404))));
         assert!(crate::db::erasures::load_cursor(&pool)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn row_deletions_walk_two_pages_and_resume_overlap_behind(pool: PgPool) {
+        let server = MockServer::start().await;
+        let u = Uuid::new_v4();
+        let f =
+            crate::db::autobio::tests::fact(&pool, u, "likes jazz", Utc::now(), Utc::now()).await;
+        let m = crate::db::autobio::tests::memory(&pool, u, "hikes", Utc::now()).await;
+        let t1 = "2026-11-10T12:00:00Z";
+        let t2 = "2026-11-10T12:05:00Z";
+        Mock::given(method("GET"))
+            .and(path("/svc/v1/rows/deletions"))
+            .and(query_param("since", "1970-01-01T00:00:00Z"))
+            .and(query_param(
+                "after_id",
+                "00000000-0000-0000-0000-000000000000",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "deletions": [{ "kind": "fact", "id": f, "deleted_at": t1 }],
+                "next": { "deleted_at": t1, "id": f }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/svc/v1/rows/deletions"))
+            .and(query_param("since", t1))
+            .and(query_param("after_id", f.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "deletions": [
+                    { "kind": "memory", "id": m, "deleted_at": t2 },
+                    { "kind": "journal", "id": Uuid::new_v4(), "deleted_at": t2 }
+                ],
+                "next": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            run_row_deletions_once(&pool, &client(&server))
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(mirrored_facts(&pool).await, 0);
+        let memories: i64 = sqlx::query_scalar("SELECT count(*) FROM pothos.memory_mirror")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(memories, 0);
+        let cur = crate::db::row_deletions::load_cursor(&pool)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cur.deleted_at.to_rfc3339(), "2026-11-10T12:05:00+00:00");
+
+        // The next sweep resumes five seconds behind the cursor.
+        Mock::given(method("GET"))
+            .and(path("/svc/v1/rows/deletions"))
+            .and(query_param("since", "2026-11-10T12:04:55Z"))
+            .and(query_param(
+                "after_id",
+                "00000000-0000-0000-0000-000000000000",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "deletions": [{ "kind": "memory", "id": m, "deleted_at": t2 }], "next": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(
+            run_row_deletions_once(&pool, &client(&server))
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn row_deletions_404_leaves_cursor_untouched(pool: PgPool) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let err = run_row_deletions_once(&pool, &client(&server))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SweepError::Engine(EngineError::Status(404))));
+        assert!(crate::db::row_deletions::load_cursor(&pool)
             .await
             .unwrap()
             .is_none());
@@ -738,7 +878,10 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        assert_eq!(run_facts_once(&pool, &facts_client(&server)).await.unwrap(), 2);
+        assert_eq!(
+            run_facts_once(&pool, &facts_client(&server)).await.unwrap(),
+            2
+        );
         assert_eq!(mirrored_facts(&pool).await, 2);
 
         let server = MockServer::start().await;
@@ -756,7 +899,10 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        assert_eq!(run_facts_once(&pool, &facts_client(&server)).await.unwrap(), 1);
+        assert_eq!(
+            run_facts_once(&pool, &facts_client(&server)).await.unwrap(),
+            1
+        );
         assert_eq!(mirrored_facts(&pool).await, 2);
     }
 
@@ -782,7 +928,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SweepError::Engine(EngineError::Status(404))));
-        assert!(crate::db::facts::load_cursor(&pool).await.unwrap().is_none());
+        assert!(crate::db::facts::load_cursor(&pool)
+            .await
+            .unwrap()
+            .is_none());
         assert_eq!(mirrored_facts(&pool).await, 0);
     }
 

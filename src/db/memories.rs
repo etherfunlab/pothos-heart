@@ -30,7 +30,9 @@ pub async fn apply_page(pool: &PgPool, rows: &[MemoryRow]) -> sqlx::Result<()> {
     for r in rows {
         sqlx::query(
             "INSERT INTO pothos.memory_mirror (id, user_id, content, category, metadata, engine_created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING",
+             SELECT $1, $2, $3, $4, $5, $6 \
+             WHERE NOT EXISTS (SELECT 1 FROM pothos.row_tombstones WHERE kind = 'memory' AND id = $1) \
+             ON CONFLICT (id) DO NOTHING",
         )
         .bind(r.id)
         .bind(r.user_id)
@@ -49,4 +51,50 @@ pub async fn apply_page(pool: &PgPool, rows: &[MemoryRow]) -> sqlx::Result<()> {
     .execute(&mut *tx)
     .await?;
     tx.commit().await
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    use super::*;
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_tombstoned_id_is_not_mirrored(pool: PgPool) {
+        let (gone, live, u) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let at = |min| Utc.with_ymd_and_hms(2026, 11, 10, 12, min, 0).unwrap();
+        // A fact tombstone with the live memory's id is another stream's row.
+        for (kind, id) in [("memory", gone), ("fact", live)] {
+            sqlx::query(
+                "INSERT INTO pothos.row_tombstones (kind, id, deleted_at) VALUES ($1, $2, now())",
+            )
+            .bind(kind)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let row = |id, min| MemoryRow {
+            id,
+            user_id: u,
+            content: "likes jazz".into(),
+            category: "preference".into(),
+            metadata: None,
+            created_at: at(min),
+        };
+
+        apply_page(&pool, &[row(gone, 0), row(live, 1)])
+            .await
+            .unwrap();
+
+        let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM pothos.memory_mirror")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(ids, vec![live]);
+        let cur = load_cursor(&pool).await.unwrap().unwrap();
+        assert_eq!((cur.created_at, cur.id), (at(1), live));
+    }
 }

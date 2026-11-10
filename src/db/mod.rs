@@ -13,6 +13,7 @@ pub mod facts;
 pub mod memories;
 pub mod mirror;
 pub mod profiles;
+pub mod row_deletions;
 pub mod verdicts;
 
 pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {
@@ -80,6 +81,8 @@ mod tests {
                 "pair_verdicts",
                 "phrase_concepts",
                 "phrase_decisions",
+                "row_deletion_cursor",
+                "row_tombstones",
                 "sync_cursor"
             ]
         );
@@ -309,12 +312,13 @@ mod tests {
         assert_eq!(ages, (None, None));
 
         // 0003-era rows survive untouched.
-        let seen: DateTime<Utc> =
-            sqlx::query_scalar("SELECT engine_updated_at FROM pothos.insight_mirror WHERE user_id = $1")
-                .bind(a)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let seen: DateTime<Utc> = sqlx::query_scalar(
+            "SELECT engine_updated_at FROM pothos.insight_mirror WHERE user_id = $1",
+        )
+        .bind(a)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(seen, t);
         let phrase: String =
             sqlx::query_scalar("SELECT phrase FROM pothos.observed_phrases WHERE id = $1")

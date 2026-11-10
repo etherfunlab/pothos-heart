@@ -108,6 +108,28 @@ pub struct ErasuresPage {
     pub next: Option<ErasureCursor>,
 }
 
+/// One row-level tombstone: a single memory or fact its owner deleted.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RowDeletion {
+    /// `memory` or `fact`; anything else is a kind this service does not mirror.
+    pub kind: String,
+    /// The id the row had in its changes stream.
+    pub id: Uuid,
+    pub deleted_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub struct RowDeletionCursor {
+    pub deleted_at: DateTime<Utc>,
+    pub id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RowDeletionsPage {
+    pub deletions: Vec<RowDeletion>,
+    pub next: Option<RowDeletionCursor>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("engine request failed: {0}")]
@@ -211,7 +233,23 @@ impl EngineClient {
         since: DateTime<Utc>,
         after_user: Uuid,
     ) -> Result<ErasuresPage, EngineError> {
-        self.page("/svc/v1/insights/deletions", since, ("after_user", after_user))
+        self.page(
+            "/svc/v1/insights/deletions",
+            since,
+            ("after_user", after_user),
+        )
+        .await
+    }
+
+    /// One page of row-level tombstones strictly after `(since, after_id)`.
+    /// Either read secret opens the stream; this uses the insights one, which
+    /// a sweeper always has.
+    pub async fn row_deletions(
+        &self,
+        since: DateTime<Utc>,
+        after_id: Uuid,
+    ) -> Result<RowDeletionsPage, EngineError> {
+        self.page("/svc/v1/rows/deletions", since, ("after_id", after_id))
             .await
     }
 
@@ -221,8 +259,14 @@ impl EngineClient {
         since: DateTime<Utc>,
         after: (&str, Uuid),
     ) -> Result<T, EngineError> {
-        self.page_with(path, EXPORT_SECRET_HEADER, self.secret.clone(), since, after)
-            .await
+        self.page_with(
+            path,
+            EXPORT_SECRET_HEADER,
+            self.secret.clone(),
+            since,
+            after,
+        )
+        .await
     }
 
     async fn page_with<T: serde::de::DeserializeOwned>(
@@ -406,13 +450,14 @@ mod tests {
         let r = &page.facts[0];
         assert_eq!((r.id, r.user_id), (f, u));
         assert_eq!(r.content, "plays weekend jazz");
-        assert_eq!(
-            (r.category.as_str(), r.domain.as_str()),
-            ("hobby", "hobby")
-        );
+        assert_eq!((r.category.as_str(), r.domain.as_str()), ("hobby", "hobby"));
         assert_eq!(r.evidence_type, "explicit_statement");
         assert_eq!(
-            (r.temporality.as_str(), r.persistence.as_str(), r.confidence.as_str()),
+            (
+                r.temporality.as_str(),
+                r.persistence.as_str(),
+                r.confidence.as_str()
+            ),
             ("current", "ongoing", "high")
         );
         assert_eq!((r.occurrences, r.session_count), (3, 2));
@@ -444,6 +489,39 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, EngineError::MissingFactsSecret));
+    }
+
+    #[tokio::test]
+    async fn row_deletions_use_the_insights_secret() {
+        let server = MockServer::start().await;
+        let id = Uuid::new_v4();
+        Mock::given(method("GET"))
+            .and(path("/svc/v1/rows/deletions"))
+            .and(header(EXPORT_SECRET_HEADER, "s".repeat(32).as_str()))
+            .and(query_param("since", "1970-01-01T00:00:00Z"))
+            .and(query_param(
+                "after_id",
+                "00000000-0000-0000-0000-000000000000",
+            ))
+            .and(query_param("limit", "1000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "deletions": [{ "kind": "fact", "id": id, "deleted_at": "2026-11-10T12:00:00Z" }],
+                "next": { "deleted_at": "2026-11-10T12:00:00Z", "id": id }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let page = EngineClient::new(&cfg(&server))
+            .row_deletions(DateTime::<Utc>::UNIX_EPOCH, Uuid::nil())
+            .await
+            .unwrap();
+        assert_eq!(page.deletions.len(), 1);
+        assert_eq!(
+            (page.deletions[0].kind.as_str(), page.deletions[0].id),
+            ("fact", id)
+        );
+        assert_eq!(page.next.unwrap().id, id);
     }
 
     #[tokio::test]
