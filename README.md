@@ -66,6 +66,14 @@ Without both `ENGINE_BASE_URL` and `ENGINE_EXPORT_SECRET` the sweeper stays off;
 
 The sweeper needs [eros-engine](https://github.com/etherfunlab/eros-engine) **v2.6.4 or later** for the insights export and the two deletion streams, with `INSIGHTS_EXPORT_SECRET` set on the engine (at least 32 bytes) to the same value as `ENGINE_EXPORT_SECRET` here. The facts export is a second credential: `FACTS_EXPORT_SECRET` on the engine, `ENGINE_FACTS_SECRET` here. It is optional — without it (or against an engine that answers 404) the facts step is skipped and autobio runs on the memory material alone, as it does when the memories export is missing the other way around.
 
+### Container image
+
+Each `v*` tag publishes `ghcr.io/etherfunlab/pothos-heart:<version>` (and `:latest`), built from `docker/Dockerfile` for `linux/amd64`. The entrypoint is the binary and the default command is `serve`; run `migrate` as a release step before a new version serves. The image listens on `0.0.0.0:8090` and reads `pothos.toml` from `/app`; mount another file and set `POTHOS_WEIGHTS` to change the weights.
+
+- `migrate` needs a direct database connection, as above; `serve` can use any connection as the owning role.
+- Run one instance with the sweeper on. A platform that stops idle machines also stops the sweeper, so keep that instance running.
+- `GET /healthz` is the health check.
+
 ## API
 
 Every `/v1/*` call needs `x-pothos-caller-secret: <POTHOS_CALLER_SECRET>`. This is a service-to-service API: end users never call it, and their identity system is not this service's business.
